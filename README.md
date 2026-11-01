@@ -4,6 +4,10 @@
 
 # M-Film
 
+> **EOS R development fork:** experimental source and build instructions are in
+> [EOS_R.md](EOS_R.md). The original EOS R has not been hardware-tested here;
+> CR3 film development is not implemented. Other cameras retain upstream behavior.
+
 **Your Canon, shot like film.**
 
 A film camera's interface for Canon cameras that run Magic Lantern.<br>

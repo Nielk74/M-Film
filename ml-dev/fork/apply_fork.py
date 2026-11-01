@@ -18,17 +18,26 @@ root = Path(sys.argv[1])
 # --no-darkroom: the film OS without its in-camera darkroom (fos_nodark.c in its place), ~60 KB less at boot
 NO_DARKROOM = "--no-darkroom" in sys.argv[2:]
 PLATFORMS = [a for a in sys.argv[2:] if not a.startswith("--")] or ["EOSM.202"]
+EXPERIMENTAL_EOS_R = "--experimental-eos-r" in sys.argv[2:]
+
+# Reject an unsupported combination before touching the shared ML sources.
+if "R.180" in PLATFORMS:
+    if not EXPERIMENTAL_EOS_R or not NO_DARKROOM:
+        sys.exit("EOS R requires --experimental-eos-r --no-darkroom; see EOS_R.md")
+    api = (root / "src/picstyle.h").read_text(encoding="utf-8")
+    if "picstyle_set_current_contrast" not in api:
+        sys.exit("EOS R needs the newer Picture Style API; use the revision pinned in build_eos_r.sh")
 
 
 def edit(rel, old, new, marker):
     p = root / rel
-    text = p.read_text()
+    text = p.read_text(encoding="utf-8")
     if marker in text:
         print(f"  {rel}: already applied")
         return
     if old not in text:
         sys.exit(f"  {rel}: anchor not found, ML source changed?")
-    p.write_text(text.replace(old, new, 1))
+    p.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
     print(f"  {rel}: patched")
 
 
@@ -73,15 +82,25 @@ edit("src/menu.c",
      '#include "powersave.h"\n#include "filmroll.h"\n',
      '#include "filmroll.h"')
 
+if "R.180" in PLATFORMS:
+    # The EOS R compositor converts an indexed staging buffer to RGBA.
+    edit("src/bmp.c", '#include "bmp.h"\n',
+         '#include "bmp.h"\n#include "filmroll.h"\n', '#include "filmroll.h"')
+    edit("src/bmp.c", "uint32_t indexed2rgb(uint8_t color)\n{\n",
+         "uint32_t indexed2rgb(uint8_t color)\n{\n"
+         "#ifdef FEATURE_FILMROLL\n"
+         "    if (filmroll_rgba_palette) return filmroll_rgba_palette[color];\n"
+         "#endif\n", "if (filmroll_rgba_palette)")
+
 # lua doesn't build with this toolchain (newlib header clash) and isn't needed
 edit("modules/Makefile",
      "    img_name \\\n    lua \\\n",
      "    img_name \\\n",
      "lua dropped by film-mode fork")
 p = root / "modules/Makefile"
-if "lua dropped by film-mode fork" not in p.read_text():
-    p.write_text(p.read_text().replace(
-        "ML_MODULES = \\\n", "# lua dropped by film-mode fork (newlib header clash with gcc 14)\nML_MODULES = \\\n", 1))
+if "lua dropped by film-mode fork" not in p.read_text(encoding="utf-8"):
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        "ML_MODULES = \\\n", "# lua dropped by film-mode fork (newlib header clash with gcc 14)\nML_MODULES = \\\n", 1), encoding="utf-8", newline="\n")
 
 # 6D only: a bigger share of Canon's AllocateMemory pool for autoexec.bin.
 # ML takes 0x44C000-0x4E0000 (592K) of the pool's 9152K (0x44C000-0xD3C000,
@@ -103,8 +122,8 @@ def platform(name):
     """FEATURE_FILMROLL, our objects, and no lua, for one camera."""
     # build it in
     p = root / f"platform/{name}/features.h"
-    if "FEATURE_FILMROLL" not in p.read_text():
-        p.write_text(p.read_text().rstrip("\n") + "\n\n/* film camera mode (src/filmroll.c) */\n#define FEATURE_FILMROLL\n")
+    if "FEATURE_FILMROLL" not in p.read_text(encoding="utf-8"):
+        p.write_text(p.read_text(encoding="utf-8").rstrip("\n") + "\n\n/* film camera mode (src/filmroll.c) */\n#define FEATURE_FILMROLL\n", encoding="utf-8", newline="\n")
         print(f"  platform/{name}/features.h: patched")
     else:
         print(f"  platform/{name}/features.h: already applied")
@@ -113,8 +132,10 @@ def platform(name):
     # (no fos_font: the fonts go on the card as ML/DATA/FOSFONT.BIN, see fos_gfx.h)
     FOS_OBJS = ["filmroll", "fos_gfx", "fos_film", "fos_ui", "fos_shelf", "fos_pages", "fos_hud", "fos_print"]
     FOS_OBJS += ["fos_nodark"] if NO_DARKROOM else ["fos_dark", "fos_dev", "fos_lab", "fos_looks", "fos_jpeg"]
+    if name == "R.180":
+        FOS_OBJS += ["fos_rgba"]
     p = root / f"platform/{name}/Makefile"
-    lines = p.read_text().split("\n")
+    lines = p.read_text(encoding="utf-8").split("\n")
     out, skip = [], False
     for line in lines:
         if skip:
@@ -131,16 +152,16 @@ def platform(name):
     if anchor is None:
         sys.exit(f"  platform/{name}/Makefile: anchor not found, ML source changed?")
     text = text.replace("\n\n" + anchor, "\n" + anchor).replace(anchor, block + "\n" + anchor, 1)
-    if p.read_text() != text:
-        p.write_text(text)
+    if p.read_text(encoding="utf-8") != text:
+        p.write_text(text, encoding="utf-8", newline="\n")
         print(f"  platform/{name}/Makefile: patched")
     else:
         print(f"  platform/{name}/Makefile: already applied")
 
     p = root / f"platform/{name}/modules.included"
-    mods = p.read_text().splitlines()
+    mods = p.read_text(encoding="utf-8").splitlines()
     if "lua" in mods:
-        p.write_text("\n".join(m for m in mods if m != "lua") + "\n")
+        p.write_text("\n".join(m for m in mods if m != "lua") + "\n", encoding="utf-8", newline="\n")
         print(f"  {name}/modules.included: lua removed")
     else:
         print(f"  {name}/modules.included: already applied")

@@ -19,9 +19,17 @@ static void nd_bake()
     ui_status_bar("DARKROOM");
     fos_text(cv, &fos_font_lg, ND_X, 82, "Darkroom", C_TEXT, OPAQUE, 0);
     fos_text(cv, &fos_font_sm, ND_X, 120, "This camera's M" T_DOT "FILM has no darkroom of its own,", C_TEXT2, OPAQUE, 0);
+#ifdef CONFIG_R
+    fos_text(cv, &fos_font_sm, ND_X, 144, "EOS R CR3 development is not implemented yet.", C_TEXT2, OPAQUE, 0);
+#else
     fos_text(cv, &fos_font_sm, ND_X, 144, "to leave the camera the memory it needs.", C_TEXT2, OPAQUE, 0);
+#endif
     fos_text(cv, &fos_font_sm, ND_X, 184, "Your rolls are on the card, every frame in RAW:", C_TEXT3, OPAQUE, 0);
+#ifdef CONFIG_R
+    fos_text(cv, &fos_font_sm, ND_X, 208, "copy the CR3 files to a computer to develop them.", C_ACCENT2, OPAQUE, 0);
+#else
     fos_text(cv, &fos_font_sm, ND_X, 208, "develop them with Darkrooms on a computer.", C_ACCENT2, OPAQUE, 0);
+#endif
     ui_to_bg(0);
 }
 

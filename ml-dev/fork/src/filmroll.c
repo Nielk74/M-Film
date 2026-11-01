@@ -47,6 +47,9 @@
 #include "filmroll.h"
 #include "fos.h"
 #include "fos_dev.h"
+#ifdef FEATURE_VRAM_RGBA
+#include "fos_rgba.h"
+#endif
 
 #include <stdarg.h>
 
@@ -56,13 +59,26 @@ extern void CancelDateTimer();
 /* user settings */
 static CONFIG_INT("filmroll.film",      film_sel,         0);
 static CONFIG_INT("filmroll.exp",       exp_sel,          0);
+#ifdef CONFIG_R
+static CONFIG_INT("filmroll.hud",       hud_enabled,      0);
+#else
 static CONFIG_INT("filmroll.hud",       hud_enabled,      1);
+#endif
 static CONFIG_INT("filmroll.focus",     focus_screen,     1);
 static CONFIG_INT("filmroll.leds",      leds_on_half,     1);
 static CONFIG_INT("filmroll.wind",      wind_mode,        1);   /* 0 off, 1 reminder, 2 block shutter */
+#ifdef CONFIG_R
+static CONFIG_INT("filmroll.playlock",  play_lock,        0); /* CR3 prints need a computer */
+#else
 static CONFIG_INT("filmroll.playlock",  play_lock,        1);
+#endif
+#ifdef CONFIG_R
+static CONFIG_INT("filmroll.startup",   startup_picker,   0);
+static CONFIG_INT("filmroll.bootanim",  boot_anim,        0);
+#else
 static CONFIG_INT("filmroll.startup",   startup_picker,   2);   /* 0 off, 1 when no film, 2 always */
 static CONFIG_INT("filmroll.bootanim",  boot_anim,        1);
+#endif
 static CONFIG_INT("filmroll.debug",     debug_log,        1);
 static CONFIG_INT("filmroll.mode",      film_mode,        0);   /* 0 Basic, 1 Realistic (FS_MODE) */
 static CONFIG_INT("filmroll.lens_wide", lens_widest,      6);   /* index into fos_fstops: f/1.8 */
@@ -126,7 +142,7 @@ static void dbg(const char *fmt, ...)
  * On the EOS M that is LiveView; a DSLR (100D, 650D, 700D ...) is mostly
  * shot through its optical viewfinder, so there it is also Canon's shooting
  * screen with LiveView off. */
-#ifdef CONFIG_EOSM
+#if defined(CONFIG_EOSM) || defined(CONFIG_R)
 #define FOS_LV_ONLY 1
 #else
 #define FOS_LV_ONLY 0
@@ -243,10 +259,35 @@ static void apply_film(int index)
     const struct fos_film *f = &fos_films[COERCE(index, 0, fos_nfilms - 1)];
 
     int ps = f->picstyle;
+#ifdef CONFIG_R
+    if (!prop_request_change_wait(PROP_PICTURE_STYLE, &ps, 4, 1000))
+    {
+        dbg("film: Picture Style request timed out; preview controls not changed");
+        NotifyBox(5000, "Film preview not applied: Picture Style change timed out");
+        return;
+    }
+#else
     prop_request_change_wait(PROP_PICTURE_STYLE, &ps, 4, 1000);
+#endif
     msleep(100);
 
     /* these change the current picture style, so it must be selected first */
+#ifdef CONFIG_R
+    /* The newer EOS R core handles the six-slider DIGIC 8 properties.
+     * Keep its existing property whitelist; ISO and WB remain manual. */
+    picstyle_set_current_contrast(f->contrast);
+    msleep(50);
+    picstyle_set_current_sharpness(f->sharpness);
+    msleep(50);
+    if (f->picstyle != PS_MONO)
+    {
+        picstyle_set_current_saturation(f->saturation);
+        msleep(50);
+        picstyle_set_current_color_tone(f->color_tone);
+        msleep(50);
+    }
+    NotifyBox(6000, "EOS R: set ISO %d, WB %dK manually; CR3 darkroom unavailable", f->iso, f->kelvin);
+#else
     lens_set_contrast(f->contrast);
     msleep(50);
     lens_set_sharpness(f->sharpness);
@@ -263,6 +304,7 @@ static void apply_film(int index)
     lens_set_wbs_gm(f->wbs_gm);
     lens_set_wbs_ba(f->wbs_ba);
     lens_set_rawiso(iso_to_raw(f->iso));
+#endif
 }
 
 /* Film is shot blind: the darkroom develops the RAWs, and there is no
@@ -371,7 +413,11 @@ static void record_frame(int file_number)
     char line[112];
     format_now(when, sizeof(when));
     fos_format_fstop(aperture, sizeof(aperture), current_fstop());
+#ifdef CONFIG_R
+    snprintf(line, sizeof(line), "%d  %s%04d.CR3  %s  f/%s\n",
+#else
     snprintf(line, sizeof(line), "%d  %s%04d.CR2  %s  f/%s\n",
+#endif
              frames_shot, get_file_prefix(), file_number, when, aperture);
     log_append(line);
 
@@ -459,7 +505,11 @@ static void keyq_push(int k)
  * an opacity code, which we copy from Canon's own white. One entry is
  * remembered so we notice when other code puts Canon's palette back. */
 #define PALETTE_PROBE 200
+#ifdef FEATURE_VRAM_RGBA
+const uint32_t * volatile filmroll_rgba_palette = 0;
+#else
 static uint32_t palette_probe = 0;
+#endif
 
 /* a photograph on the screen: its colours in 1..photo_n, at photo_k/256 */
 static int photo_mode = 0, photo_n = 0, photo_k = 256;
@@ -468,6 +518,18 @@ static uint8_t photo_pal[FOS_PRINT_COLOURS][3];
 static void palette_ours()
 {
     if (!DISPLAY_IS_ON) return;
+#ifdef FEATURE_VRAM_RGBA
+    /* Publish a complete table in one pointer store. The display task
+     * must never dereference the EOS R's deliberately NULL LCD_Palette. */
+    static uint32_t tables[2][256];
+    static unsigned bank;
+    bank ^= 1;
+    fos_rgba_build_palette(tables[bank], fos_pal,
+        photo_mode ? photo_pal : 0, photo_n, photo_k,
+        scr_std, scr_sat, scr_warm, scr_bright);
+    filmroll_rgba_palette = tables[bank];
+    ml_refresh_display_needed = 1;
+#else
     /* Canon's white tells the opacity and where white sits in luma
      * (its own conversion puts it at 235, not 255) */
     uint32_t white = LCD_Palette[3 * COLOR_WHITE + 2];
@@ -491,15 +553,22 @@ static void palette_ours()
         EngDrvOut(LCD_Palette[3 * i], entry);
         EngDrvOut(LCD_Palette[3 * i + 0x300], entry);
     }
+#endif
 }
 
 static void palette_canon()
 {
+#ifdef FEATURE_VRAM_RGBA
+    clrscr();
+    filmroll_rgba_palette = 0;
+    ml_refresh_display_needed = 1;
+#else
     for (int i = 1; i < 255; i++)
     {
         EngDrvOut(LCD_Palette[3 * i], LCD_Palette[3 * i + 2]);
         EngDrvOut(LCD_Palette[3 * i + 0x300], LCD_Palette[3 * i + 2]);
     }
+#endif
 }
 
 /* Take the display from Canon's GUI the same way the ML menu does:
@@ -512,8 +581,10 @@ static void film_ui_open()
     if (lv) bmp_off();
     SetGUIRequestMode(GUIMODE_ML_MENU);
     msleep(200);
+#ifndef FEATURE_VRAM_RGBA
     canon_gui_disable_front_buffer();
     CancelDateTimer();
+#endif
     clrscr();
     bmp_on();
     ui_last_mode_poke = get_ms_clock();
@@ -525,7 +596,9 @@ static void film_ui_close()
     if (lv) bmp_off();
     SetGUIRequestMode(0);
     msleep(100);
+#ifndef FEATURE_VRAM_RGBA
     canon_gui_enable_front_buffer(0);
+#endif
     clrscr();
     redraw();
     if (lv) bmp_on();
@@ -616,12 +689,14 @@ void fos_port_sleep(int ms)
         idle_wakeup_reset_counters(-10);
         last_wake = now;
     }
+#ifndef FEATURE_VRAM_RGBA
     uint32_t probe = shamem_read(LCD_Palette[3 * PALETTE_PROBE]);
     if ((probe && probe != palette_probe) || now - ui_last_palette > 1000)
     {
         palette_ours();
         ui_last_palette = now;
     }
+#endif
 }
 
 int fos_port_key()
@@ -658,17 +733,25 @@ int fos_port_abort()
 
 void fos_port_present(const uint8_t *rows, int pitch, int y0, int y1)
 {
+#ifdef FEATURE_VRAM_RGBA
+    uint8_t *vram = bmp_vram(); /* ML's 8-bit staging canvas, not Canon's RGBA surface */
+#else
     uint8_t *vram = bmp_vram_real();
+#endif
     if (!vram || !DISPLAY_IS_ON)
         return;
     y0 = COERCE(y0, 0, FOS_H);
     y1 = COERCE(y1, y0, FOS_H);
     for (int y = y0; y < y1; y++)
         memcpy(vram + y * BMPPITCH, rows + (y - y0) * pitch, FOS_W);
+#ifdef FEATURE_VRAM_RGBA
+    ml_refresh_display_needed = 1;
+#endif
 }
 
 void fos_port_palette()
 {
+#ifndef FEATURE_VRAM_RGBA
     /* once: Canon's own entries, to check the colour conversion against */
     static int logged = 0;
     if (!logged && debug_log)
@@ -681,6 +764,7 @@ void fos_port_palette()
             LCD_Palette[3 * 8 + 2], LCD_Palette[3 * 9 + 2], LCD_Palette[3 * 10 + 2], LCD_Palette[3 * 11 + 2],
             LCD_Palette[3 * 12 + 2], LCD_Palette[3 * 13 + 2], LCD_Palette[3 * 14 + 2], LCD_Palette[3 * 15 + 2]);
     }
+#endif
     photo_mode = 0;
     palette_ours();
     ui_last_palette = get_ms_clock();
@@ -1029,12 +1113,14 @@ static void hud_draw(int lit, int blink, int plate)
     h.blink = blink;
     h.fstop = current_fstop();
     h.widest = lens_is_manual() ? lens_widest : 0;
+#ifdef AE_VALUE
     if (lit)
     {
         int ev8 = get_ae_value();               /* meter reading, 1/8 EV, + = too bright */
         h.meter = 1;
         h.want = h.fstop + (ev8 * 3 + (ev8 >= 0 ? 4 : -4)) / 8;
     }
+#endif
     shutter_led(h.shutter, sizeof(h.shutter));
     h.frame = frames_shot + 1;
     h.exposures = roll_exposures;
@@ -1049,6 +1135,9 @@ static void hud_draw(int lit, int blink, int plate)
     else
 #endif
     if (vram) fos_hud_draw(vram, BMPPITCH, &h, &hud_pal);
+#ifdef FEATURE_VRAM_RGBA
+    ml_refresh_display_needed = 1;
+#endif
 }
 
 static void hud_clear()
@@ -1056,6 +1145,9 @@ static void hud_clear()
     uint8_t *vram = bmp_vram();
     if (vram)
         fos_hud_clear(vram, BMPPITCH, &hud_pal);
+#ifdef FEATURE_VRAM_RGBA
+    ml_refresh_display_needed = 1;
+#endif
 }
 
 /* one HUD refresh; called from the main loop */
@@ -1129,7 +1221,11 @@ static void hud_step()
     int now = get_ms_clock();
     int lit = !leds_on_half || get_halfshutter_pressed() || now < leds_until;
     int blink = (now / 400) % 2;
+#ifdef AE_VALUE
     int ev8 = lit ? get_ae_value() : 0;
+#else
+    int ev8 = 0; /* EOS R has no verified AE_VALUE source: no meter needle. */
+#endif
 
     int sig = lit | blink << 1 | need_wind << 2 | (frames_shot & 0xFF) << 3
             | lens_info.raw_shutter << 11 | (ev8 & 0xFF) << 19 | (current_fstop() & 0x1F) << 27;

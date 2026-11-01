@@ -1,0 +1,31 @@
+name: Experimental EOS R port
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [eos-r-port]
+    paths: ["ml-dev/**", "EOS_R.md", ".github/workflows/eos-r.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install host and ARM tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends build-essential gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev python3-numpy python3-scipy python3-pil
+      - name: Get the pinned EOS R core
+        run: |
+          git clone --filter=blob:none https://github.com/reticulatedpines/magiclantern_simplified.git "$HOME/ml/magiclantern-r"
+          git -C "$HOME/ml/magiclantern-r" checkout 142472e95054d73640f50789ac0fd66325499d82
+      - name: Host tests and experimental ARM build
+        run: bash ml-dev/build_eos_r.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: experimental-EOS-R-developer-files-NOT-HARDWARE-TESTED
+          path: ml-dev/out/eos-r-experimental/
+          if-no-files-found: error

@@ -13,4 +13,11 @@ void filmroll_menu_requested();
  * viewfinder HUD (always, in this fork) */
 int filmroll_overlays_active();
 
+#if defined(FEATURE_FILMROLL) && defined(FEATURE_VRAM_RGBA)
+#include <stdint.h>
+/* Non-NULL only while the film OS owns the indexed canvas. The normal
+ * ML palette remains in use for the HUD, messages, and Canon menus. */
+extern const uint32_t * volatile filmroll_rgba_palette;
+#endif
+
 #endif
