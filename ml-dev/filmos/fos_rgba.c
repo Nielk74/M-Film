@@ -8,7 +8,7 @@ void fos_rgba_build_palette(uint32_t out[256], const uint32_t base[256],
 {
     n = fos_clamp(n, 0, FOS_PRINT_COLOURS);
     fade = fos_clamp(fade, 0, 256);
-    out[0] = out[255] = 0;
+    out[0] = out[255] = FOS_RGBA_CLEAR;
     for (int i = 1; i < 255; i++)
     {
         uint32_t rgb = base[i];

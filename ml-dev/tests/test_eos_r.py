@@ -82,7 +82,8 @@ class EosRPatchTests(unittest.TestCase):
 
     def test_picture_style_timeout_does_not_modify_previous_style(self):
         source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
-        function = c_function(source, "static void apply_film(int index)")
+        function = (c_function(source, "static void manual_settings_prompt(int index)") + "\n"
+                    + c_function(source, "static void apply_film(int index)"))
         program = self.src / "picstyle_check.c"
         program.write_text('''#include <assert.h>
 #include "fos.h"
@@ -113,7 +114,10 @@ int main(void) {
     acknowledged = 1;
     apply_film(0);
     assert(writes == 4);
+    assert(strstr(notice, "ISO 400") != 0 && strstr(notice, "WB 5500K") != 0);
     assert(strstr(notice, "BA 2 GM -1") != 0);
+    /* NotifyBox draws one unwrapped line of large text */
+    assert(strlen(notice) <= 44);
     stock.picstyle = PS_MONO;
     apply_film(0);
     assert(writes == 6);
@@ -122,6 +126,39 @@ int main(void) {
 ''', encoding="utf-8", newline="\n")
         binary = self.src / "picstyle_check"
         result = run("gcc", "-std=gnu99", "-Wall", "-Wextra", "-Werror", "-I", str(SIM.parent), str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_capture_check_reports_its_notice_so_the_settings_prompt_is_repeated(self):
+        # ui_task re-shows the ISO/WB prompt only when this returns 1.
+        source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
+        function = c_function(source, "static int film_capture_check()")
+        program = self.src / "capture_check.c"
+        program.write_text('''#include <assert.h>
+#include <stdio.h>
+#define PICQ_RAW 0x4060000
+#define NotifyBox(timeout, ...) (notices++)
+#define dbg(...) ((void)0)
+static int roll_loaded, pic_quality, image_review_time, notices;
+''' + function + '''
+int main(void) {
+    roll_loaded = 0;
+    assert(film_capture_check() == 0 && notices == 0);
+    roll_loaded = 1;
+    pic_quality = PICQ_RAW;
+    image_review_time = 0;
+    assert(film_capture_check() == 0 && notices == 0);
+    image_review_time = 2;
+    assert(film_capture_check() == 1 && notices == 1);
+    pic_quality = 0;
+    image_review_time = 0;
+    assert(film_capture_check() == 1 && notices == 2);
+    return 0;
+}
+''', encoding="utf-8", newline="\n")
+        binary = self.src / "capture_check"
+        result = run("gcc", "-std=gnu99", "-Wall", "-Wextra", "-Werror", str(program), "-o", str(binary))
         self.assertEqual(result.returncode, 0, result.stderr)
         result = run(str(binary))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -159,19 +196,21 @@ int main(void) {
     uint32_t colors[256];
     fos_rgba_build_palette(colors, base, 0, 0, 256, 0, 0, 0, 0);
     filmroll_rgba_palette = colors;
-    assert(indexed2rgb(0) == 0);
+    /* transparent, yet non-zero so ML's refresh still writes the pixel */
+    assert(FOS_RGBA_CLEAR != 0 && FOS_RGBA_CLEAR >> 24 == 0);
+    assert(indexed2rgb(0) == FOS_RGBA_CLEAR);
     assert(indexed2rgb(1) == 0xffffffff);
     assert(indexed2rgb(2) == 0xff000000);
     assert(indexed2rgb(200) == 0xffffffff);
     assert(indexed2rgb(254) == 0xffffffff);
-    assert(indexed2rgb(255) == 0);
+    assert(indexed2rgb(255) == FOS_RGBA_CLEAR);
     const uint8_t photo[1][3] = { {255, 255, 255} };
     fos_rgba_build_palette(colors, base, photo, 1, 128, 0, 0, 0, 0);
     uint32_t mid = indexed2rgb(1) & 255;
     assert(mid >= 125 && mid <= 129);
     fos_rgba_build_palette(colors, base, photo, 1, 0, 0, 0, 0, 0);
     assert(indexed2rgb(1) == 0xff000000);
-    assert(indexed2rgb(0) == 0);
+    assert(indexed2rgb(0) == FOS_RGBA_CLEAR);
     palette_reads = 0;
     simulate_close = 1;
     assert(indexed2rgb(1) == 0xff000000);

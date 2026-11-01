@@ -254,6 +254,21 @@ static int iso_to_raw(int iso)
     return raw;
 }
 
+#ifdef CONFIG_R
+/* The EOS R core can't write ISO or white balance: ask for them.
+ * One short line, since NotifyBox neither wraps nor takes a newline. */
+static void manual_settings_prompt(int index)
+{
+    const struct fos_film *f = &fos_films[COERCE(index, 0, fos_nfilms - 1)];
+    NotifyBox(6000, "Canon menu: ISO %d, WB %dK, BA %d GM %d",
+              f->iso, f->kelvin, f->wbs_ba, f->wbs_gm);
+}
+
+/* NotifyBox shows one message: when the capture check's notice replaced
+ * the prompt, show it again at this time (0: nothing pending) */
+static int manual_prompt_due = 0;
+#endif
+
 static void apply_film(int index)
 {
     const struct fos_film *f = &fos_films[COERCE(index, 0, fos_nfilms - 1)];
@@ -286,8 +301,7 @@ static void apply_film(int index)
         picstyle_set_current_color_tone(f->color_tone);
         msleep(50);
     }
-    NotifyBox(6000, "Set ISO %d, WB %dK, shift BA %d GM %d in Canon menu",
-              f->iso, f->kelvin, f->wbs_ba, f->wbs_gm);
+    manual_settings_prompt(index);
 #else
     lens_set_contrast(f->contrast);
     msleep(50);
@@ -311,16 +325,17 @@ static void apply_film(int index)
 /* Film is shot blind: the darkroom develops the RAWs, and there is no
  * image review to peek at. ML doesn't change these Canon settings itself
  * (writing the picture quality property can upset Canon's firmware), so
- * it asks for them. */
-static void film_capture_check()
+ * it asks for them. Returns 1 when it put up a notice. */
+static int film_capture_check()
 {
-    if (!roll_loaded) return;
+    if (!roll_loaded) return 0;
     int raw = (pic_quality & 0xFE00FF) == (PICQ_RAW & 0xFE00FF);
     int review_off = image_review_time == 0;
-    if (raw && review_off) return;
+    if (raw && review_off) return 0;
     dbg("capture: quality %x, review %d", pic_quality, image_review_time);
     NotifyBox(6000, "Film: in Canon's menu set %s%s%s", raw ? "" : "Image quality RAW",
               !raw && !review_off ? " and " : "", review_off ? "" : "Image review Off");
+    return 1;
 }
 
 /* ---------------------------------------------------------------- aperture */
@@ -637,7 +652,12 @@ static void ui_task(int open)
     {
         apply_film(roll_film);
         beep();
+#ifdef CONFIG_R
+        /* the settings prompt again once this notice has had its 6 s */
+        manual_prompt_due = film_capture_check() ? get_ms_clock() + 6500 : 0;
+#else
         film_capture_check();
+#endif
     }
     if (dev_busy)
     {
@@ -1537,6 +1557,13 @@ static void filmroll_task()
             hud_step();                     /* every 100 ms */
 
         int now = get_ms_clock();
+#ifdef CONFIG_R
+        if (manual_prompt_due && now > manual_prompt_due && !ui_running)
+        {
+            manual_prompt_due = 0;
+            manual_settings_prompt(roll_film);
+        }
+#endif
         if (now - last_alive > 60000)
         {
             dbg("main: alive, roll %d loaded %d shot %d/%d file %d",
