@@ -86,11 +86,17 @@ if "R.180" in PLATFORMS:
     # The EOS R compositor converts an indexed staging buffer to RGBA.
     edit("src/bmp.c", '#include "bmp.h"\n',
          '#include "bmp.h"\n#include "filmroll.h"\n', '#include "filmroll.h"')
-    edit("src/bmp.c", "uint32_t indexed2rgb(uint8_t color)\n{\n",
-         "uint32_t indexed2rgb(uint8_t color)\n{\n"
-         "#ifdef FEATURE_FILMROLL\n"
-         "    if (filmroll_rgba_palette) return filmroll_rgba_palette[color];\n"
-         "#endif\n", "if (filmroll_rgba_palette)")
+    old_dispatch = "    if (filmroll_rgba_palette) return filmroll_rgba_palette[color];\n"
+    safe_dispatch = (
+        "    const uint32_t * const filmroll_palette_snapshot = filmroll_rgba_palette;\n"
+        "    if (filmroll_palette_snapshot) return filmroll_palette_snapshot[color];\n")
+    if old_dispatch in (root / "src/bmp.c").read_text(encoding="utf-8"):
+        edit("src/bmp.c", old_dispatch, safe_dispatch, "filmroll_palette_snapshot")
+    else:
+        edit("src/bmp.c", "uint32_t indexed2rgb(uint8_t color)\n{\n",
+             "uint32_t indexed2rgb(uint8_t color)\n{\n"
+             "#ifdef FEATURE_FILMROLL\n" + safe_dispatch + "#endif\n",
+             "filmroll_palette_snapshot")
 
 # lua doesn't build with this toolchain (newlib header clash) and isn't needed
 edit("modules/Makefile",

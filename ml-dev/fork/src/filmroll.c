@@ -286,7 +286,8 @@ static void apply_film(int index)
         picstyle_set_current_color_tone(f->color_tone);
         msleep(50);
     }
-    NotifyBox(6000, "EOS R: set ISO %d, WB %dK manually; CR3 darkroom unavailable", f->iso, f->kelvin);
+    NotifyBox(6000, "Set ISO %d, WB %dK, shift BA %d GM %d in Canon menu",
+              f->iso, f->kelvin, f->wbs_ba, f->wbs_gm);
 #else
     lens_set_contrast(f->contrast);
     msleep(50);

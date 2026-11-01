@@ -84,6 +84,8 @@ They do not execute the camera's firmware, compositor or hardware.
 - Experimental EOS R `autoexec.bin` links with fatal warnings enabled for core
   and Film OS sources. Upstream TinyCC emits its pre-existing FIXME warning.
 - All eight host tests pass; the scene regression covers 19 scripted scenes.
+- The palette-close regression reproduces the unsafe double read and passes
+  after the fix; ARM disassembly confirms the converter loads the pointer once.
 - Both synthetic CR2 channel layouts decode without sample mismatches; native
   and ARM-style unaligned builds produce identical print files.
 - The original full-darkroom EOS M build cross-compiles against its original

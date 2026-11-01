@@ -90,9 +90,10 @@ class EosRPatchTests(unittest.TestCase):
 #define COERCE(x, lo, hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
 #define PROP_PICTURE_STYLE 1
 #define msleep(...) ((void)0)
-#define NotifyBox(...) ((void)0)
+#define NotifyBox(timeout, ...) snprintf(notice, sizeof(notice), __VA_ARGS__)
 #define dbg(...) ((void)0)
-static struct fos_film stock = { .picstyle = PS_STANDARD };
+static char notice[192];
+static struct fos_film stock = { .picstyle = PS_STANDARD, .iso = 400, .kelvin = 5500, .wbs_ba = 2, .wbs_gm = -1 };
 const struct fos_film *fos_films = &stock;
 int fos_nfilms = 1;
 static int acknowledged, writes;
@@ -112,6 +113,7 @@ int main(void) {
     acknowledged = 1;
     apply_film(0);
     assert(writes == 4);
+    assert(strstr(notice, "BA 2 GM -1") != 0);
     stock.picstyle = PS_MONO;
     apply_film(0);
     assert(writes == 6);
@@ -142,7 +144,15 @@ int main(void) {
 #define FEATURE_FILMROLL
 #define RGB_LUT_SIZE 80
 static uint32_t indexed2rgbLUT[80] = { [1] = 0xffebebeb, [4] = 0xffa33800 };
-const uint32_t * volatile filmroll_rgba_palette;
+static const uint32_t * volatile live_palette;
+static int simulate_close, palette_reads;
+/* Model a UI close on a second shared-pointer load. A local snapshot
+ * stays valid because the palette banks have static storage duration. */
+static const uint32_t * volatile *palette_slot(void) {
+    if (simulate_close && ++palette_reads == 2) live_palette = 0;
+    return &live_palette;
+}
+#define filmroll_rgba_palette (*palette_slot())
 ''' + dispatch + '''
 int main(void) {
     uint32_t base[256] = { [1] = 0xffffff, [200] = 0xffffff, [254] = 0xffffff };
@@ -162,6 +172,11 @@ int main(void) {
     fos_rgba_build_palette(colors, base, photo, 1, 0, 0, 0, 0, 0);
     assert(indexed2rgb(1) == 0xff000000);
     assert(indexed2rgb(0) == 0);
+    palette_reads = 0;
+    simulate_close = 1;
+    assert(indexed2rgb(1) == 0xff000000);
+    assert(palette_reads == 1);
+    simulate_close = 0;
     filmroll_rgba_palette = 0;
     assert(indexed2rgb(1) == 0xffebebeb);
     assert(indexed2rgb(200) == 0xffa33800);
