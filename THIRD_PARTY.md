@@ -9,6 +9,8 @@
   LibRaw's `src/decoders/crx.cpp` (Alexey Danilchenko, Alex Tutubalin), used here under the LGPL 2.1 terms that
   allow it in this GPL-2.0 program; the format notes in https://github.com/lclevy/canon_cr3 helped too. LibRaw
   also checks that decoder in the tests. https://www.libraw.org
+- **grmod-film** (GPL-2.0, from GR Mod by Maxwooow, https://github.com/Maxwooow/Ricoh-GRMod): the EOS R's
+  Portra 400 (`ml-dev/films/eos_r/`) is made with its film recipe, film response and grain tiles.
 - **Barlow** font family (SIL Open Font License 1.1): `ml-dev/filmos/fonts/OFL.txt`.
 - Film names and box art are descriptive and made for this project; they are not affiliated with or endorsed
   by Kodak, Fujifilm, CineStill, Ilford, Agfa or others. "Canon" and "EOS M" are trademarks of Canon Inc.;

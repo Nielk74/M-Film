@@ -17,6 +17,7 @@ int main(int argc, char **argv)
     fwrite(r->rawdata.raw_image, 2, (size_t) r->sizes.raw_width * r->sizes.raw_height, f);
     fclose(f);
     printf("%d %d\n", r->sizes.raw_width, r->sizes.raw_height);
+    printf("cam_mul %f %f %f %f\n", r->color.cam_mul[0], r->color.cam_mul[1], r->color.cam_mul[2], r->color.cam_mul[3]);
     libraw_close(r);
     return 0;
 }

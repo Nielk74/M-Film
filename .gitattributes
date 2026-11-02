@@ -5,3 +5,5 @@
 *.h  text eol=lf
 *.patch text eol=lf
 Makefile text eol=lf
+*.lut binary
+*.bin binary

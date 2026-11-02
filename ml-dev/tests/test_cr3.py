@@ -228,19 +228,131 @@ class BigJpegTests(unittest.TestCase):
         self.assertEqual(bottom, 0, result.stdout)
 
 
+def install_tables(folder):
+    """The EOS R's own Portra 400 table and grain, as its build puts them on the card."""
+    folder.mkdir(exist_ok=True)
+    result = run("python3", ROOT / "ml-dev/films/eos_r/install.py", folder)
+    if result.returncode:
+        raise RuntimeError(result.stdout + result.stderr)
+
+
+class PortraTests(unittest.TestCase):
+    """The EOS R's Portra 400: the shot's white balance, a quarter of the scanner, its table."""
+
+    TABLE = "095f0b15e87e8afe"
+    GRAIN = "e973373be1a7b41e"
+
+    @classmethod
+    def setUpClass(cls):
+        result = run("make", "-C", SIM, "-j4", "out/devtest-r")
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.work = Path(cls.tmp.name)
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.cr3 = sample("Canon_EOS_R_RAW_ISO_100.CR3")
+
+    def develop(self, film, tables=None, source=None):
+        env = {**os.environ}
+        if tables:
+            env["FOS_LUT_DIR"] = str(tables)
+        return subprocess.run(
+            [str(SIM / "out/devtest-r"), "-f", film, "-j", str(self.work / "o.jpg"), str(source or self.cr3), str(self.work / "o.FOP")],
+            cwd=SIM, text=True, capture_output=True, timeout=300, env=env)
+
+    def test_white_balance_is_libraws(self):
+        result = run("gcc", "-O2", SIM / "tools/rawdump.c", "-lraw", "-o", self.work / "rawdump")
+        if result.returncode:
+            unavailable("no LibRaw: " + result.stderr)
+        result = run(self.work / "rawdump", self.cr3, self.work / "o.u16")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        r, g, b, _ = (float(v) for v in re.search(r"cam_mul (\S+) (\S+) (\S+) (\S+)", result.stdout).groups())
+        result = self.develop("portra400")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        got = re.search(r"as shot: (\S+) (\S+)", result.stderr)
+        self.assertIsNotNone(got, result.stderr)
+        self.assertAlmostEqual(float(got.group(1)), r / g, places=3)
+        self.assertAlmostEqual(float(got.group(2)), b / g, places=3)
+
+    def test_only_portra_takes_the_shots_white_balance(self):
+        result = self.develop("gold200")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("as shot:", result.stderr)
+
+    def test_a_file_without_it_develops_at_daylight(self):
+        # another version of Canon's colour data: its numbers may be elsewhere
+        data = bytearray(self.cr3.read_bytes())
+        data[len(data) - 41680 + 1884 + 46] = 99
+        path = self.work / "other.CR3"
+        path.write_bytes(data)
+        result = self.develop("portra400", source=path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("as shot:", result.stderr)
+
+    def test_the_table_is_the_approved_one(self):
+        table = ROOT / "ml-dev/films/eos_r/portra400.lut"
+        self.assertEqual(table.stat().st_size, 33 ** 3 * 3)
+        self.assertEqual(sha256(table)[:16], self.TABLE)
+
+    def test_the_card_table_is_used_and_an_old_one_is_not(self):
+        tables = self.work / "tables"
+        install_tables(tables)
+        self.assertEqual((tables / "LOOK00.LUT").stat().st_size, 8 + 33 ** 3 * 3)
+        self.assertEqual((tables / "LOOK00.LUT").read_bytes()[8:], (ROOT / "ml-dev/films/eos_r/portra400.lut").read_bytes())
+        result = self.develop("portra400", tables)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with_table = sha256(self.work / "o.jpg")
+
+        # a card's table from before, the same numbers under the look's old mark, isn't taken for it
+        old = self.work / "old"
+        old.mkdir()
+        made = (tables / "LOOK00.LUT").read_bytes()
+        (old / "LOOK00.LUT").write_bytes(made[:4] + bytes([made[4] ^ 0x46]) + made[5:])
+        result = self.develop("portra400", old)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(sha256(self.work / "o.jpg"), with_table)
+
+    def test_the_grain_is_the_cards_and_it_can_go_missing(self):
+        grain = ROOT / "ml-dev/films/eos_r/grain.bin"
+        self.assertEqual(grain.stat().st_size, 2 * 128 * 128 + 256)
+        self.assertEqual(sha256(grain)[:16], self.GRAIN)
+        tables = self.work / "grain"
+        install_tables(tables)
+        self.assertEqual(self.develop("portra400", tables).returncode, 0)
+        film = sha256(self.work / "o.jpg")
+        self.assertEqual(self.develop("gold200", tables).returncode, 0)
+        path = tables / "GRAIN.BIN"
+        whole = path.read_bytes()
+        outputs = set()
+        for damaged in (b"", whole[:1000], b"XXXX" + whole[4:]):
+            path.write_bytes(damaged)
+            result = self.develop("portra400", tables)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.add(sha256(self.work / "o.jpg"))
+        self.assertEqual(len(outputs), 1, "all of these fall back to the same noise")
+        self.assertNotIn(film, outputs)
+
+    def test_mixing_without_the_table_never_takes_its_place(self):
+        empty = self.work / "empty"
+        empty.mkdir()
+        result = self.develop("portra400", empty)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((empty / "LOOK00.LUT").exists())
+
+
 class SameOutputTests(unittest.TestCase):
     """Speed work may not change one byte of what comes out."""
 
-    # sha256 (first 20) of the JPEG and the print, as developed before any speed work.
-    # They came out the same from this PC's build and from emulated ARM.
+    # sha256 (first 20) of the JPEG and the print, with the card's tables. They came out the same
+    # from this PC's build and from emulated ARM.
     EXPECTED = [
-        ("portra400", {}, False, "f6e4d6c018186ef7b67f", "7030e1245fa37c7393c5"),
+        ("portra400", {}, False, "e95dde42a8fd9970d187", "879779158f1c98f1c95e"),
         ("gold200", {}, False, "11fe93c1d274020367e3", "40bebf7bc36140659ca3"),
         ("cinestill800t", {}, False, "ae3a332999e9ffe3fafc", "af40a97e6b2181dfd0de"),
-        ("portra400", {}, True, "baf2b5ec2ce965cc74d8", "fd7160439334bf2a08c1"),
-        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "f78ff99654be701172c2", None),
-        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "b262b454a62d0e2a2d67", None),
-        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "d7b8beab7dcf9156ffbf", None),
+        ("portra400", {}, True, "35b2b11abf87e7c6cc49", "e1722b837de9f3163418"),
+        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "f2e5b7f089fd1e979c25", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "074b12159e5840622c37", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "dbbb44492029a3721ee0", None),
     ]
 
     def test_every_size_and_film_is_byte_identical(self):
@@ -249,6 +361,7 @@ class SameOutputTests(unittest.TestCase):
         good = sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes()
         with tempfile.TemporaryDirectory() as work:
             work = Path(work)
+            install_tables(work / "tables")
             (work / "wide.CR3").write_bytes(good)
             tall = bytearray(good)
             base = tall.find(b"CMT1") + 4
@@ -263,7 +376,8 @@ class SameOutputTests(unittest.TestCase):
                     source = work / ("tall.CR3" if vertical else "wide.CR3")
                     done = subprocess.run(
                         [str(SIM / "out/devtest-r"), "-f", film, "-j", str(work / "o.jpg"), str(source), str(work / "o.FOP")],
-                        cwd=SIM, text=True, capture_output=True, timeout=300, env={**os.environ, **env})
+                        cwd=SIM, text=True, capture_output=True, timeout=300,
+                        env={**os.environ, "FOS_LUT_DIR": str(work / "tables"), **env})
                     self.assertEqual(done.returncode, 0, done.stderr)
                     self.assertEqual(sha256(work / "o.jpg")[:20], jpeg_hash)
                     if print_hash:
@@ -304,13 +418,15 @@ class Cr3DamageTests(unittest.TestCase):
         self.assertEqual(self.develop(self.good, "good.CR3").returncode, 0)
 
     def test_every_size_stays_inside_its_buffers(self):
+        install_tables(self.work / "tables")
         for limit in ("999999999", "60000000", "45000000", "30000000", "8000000"):
             with self.subTest(limit=limit, vertical=False):
                 path = self.work / "sizes.CR3"
                 path.write_bytes(self.good)
                 result = subprocess.run(
                     [str(self.work / "devtest-asan"), "-j", str(self.work / "sizes.jpg"), str(path), str(self.work / "sizes.FOP")],
-                    cwd=SIM, text=True, capture_output=True, timeout=300, env={**os.environ, "FOS_ALLOC_TOTAL": limit})
+                    cwd=SIM, text=True, capture_output=True, timeout=300,
+                    env={**os.environ, "FOS_ALLOC_TOTAL": limit, "FOS_LUT_DIR": str(self.work / "tables")})
                 self.assertNotIn("AddressSanitizer", result.stderr)
                 self.assertEqual(result.returncode, 0, result.stderr[-500:])
 
@@ -323,8 +439,9 @@ class Cr3DamageTests(unittest.TestCase):
     def test_flipped_bytes_never_overrun(self):
         # In the boxes, the CRX header, and the coded planes
         rng = random.Random(1234)
-        spans = [(24, 31000), (0x32f058, 0x32f058 + 216), (0x32f058 + 216, 0x32f058 + 3000000)]
-        for trial in range(30):
+        ctmd = len(self.good) - 41680
+        spans = [(24, 31000), (0x32f058, 0x32f058 + 216), (0x32f058 + 216, 0x32f058 + 3000000), (ctmd, ctmd + 2100)]
+        for trial in range(36):
             data = bytearray(self.good)
             low, high = spans[trial % len(spans)]
             for _ in range(1 + trial % 12):

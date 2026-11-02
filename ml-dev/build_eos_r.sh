@@ -48,6 +48,7 @@ gcc -O2 -std=gnu99 -DFOS_DEV_TEST -I"$F" -o "$HERE/out/eos-r-devtest" "$F"/sim/d
 mkdir -p "$OUT/ML/DARKROOM"
 FOS_FILMS="$OUT/ML/data/FOSFILMS.BIN" "$HERE/out/eos-r-devtest" -T "$OUT/ML/DARKROOM"
 python3 "$F/tools/genfilms.py" "$OUT/ML/data/FOSFILMS.BIN" --tables "$OUT/ML/DARKROOM"
+python3 "$HERE/films/eos_r/install.py" "$OUT/ML/DARKROOM"
 # Never auto-open experimental UI at boot. A developer invokes Home with TRASH.
 printf 'filmroll.startup = 0\nfilmroll.bootanim = 0\nfilmroll.hud = 0\nfilmroll.playlock = 0\n' > "$OUT/ML/SETTINGS/magic.cfg"
 cp "$HERE/../EOS_R.md" "$OUT/EOS_R.md"

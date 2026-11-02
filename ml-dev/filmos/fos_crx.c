@@ -78,7 +78,8 @@ static void parse_track(struct fos_cr3 *c, const uint8_t *b, long n, int depth)
     static const char *const inner[] = { "trak", "mdia", "minf", "stbl" };
     int width = 0, height = 0;
     const uint8_t *cmp = 0;
-    long offset = -1;
+    long offset = -1, sample_size = 0;
+    int ctmd = 0;
     for (long o = 0; o + 8 <= n; )
     {
         long size = be32(b + o);
@@ -101,9 +102,17 @@ static void parse_track(struct fos_cr3 *c, const uint8_t *b, long n, int depth)
                 p += ps;
             }
         }
+        if (depth == 4 && box_is(b + o, "stsd") && size > 24 && box_is(b + o + 16, "CTMD")) ctmd = 1;
+        if (depth == 4 && box_is(b + o, "stsz") && size >= 20)
+            sample_size = (long) (be32(b + o + 12) || size < 24 ? be32(b + o + 12) : be32(b + o + 20));
         if (depth == 4 && box_is(b + o, "co64") && size >= 24 && be32(b + o + 12) == 1 && !be32(b + o + 16))
             offset = (long) be32(b + o + 20);
         o += size;
+    }
+    if (depth == 4 && ctmd && offset > 0)
+    {
+        c->ctmd_offset = (int) offset;
+        c->ctmd_size = (int) sample_size;
     }
     if (depth != 4 || !cmp || offset < 0) return;
     /* the largest: the sensor's mosaic, not the small one beside it */
@@ -120,6 +129,38 @@ static void parse_track(struct fos_cr3 *c, const uint8_t *b, long n, int depth)
     c->levels = cmp[26] & 15;
     c->hdr_size = (int) be32(cmp + 28);
     c->hdr_offset = (int) offset;
+}
+
+/* The metadata track is a run of records (size, type, ...). Record 8 has the maker note's TIFF
+ * 20 bytes in, and in that tag 0x4001, Canon's colour data: version 17 on the EOS R, with the
+ * shot's R, G, G, B at byte 142, the same on every frame tried against LibRaw. */
+int fos_cr3_white(void *f, const struct fos_cr3 *c, float *r, float *b)
+{
+    uint8_t h[256];
+    long o = c->ctmd_offset;
+    const long end = o + c->ctmd_size;
+    if (o <= 0) return 0;
+    for (int i = 0; i < 16 && o + 6 <= end; i++)
+    {
+        if (fos_port_seek(f, (int) o) < 0 || fos_port_read(f, h, 6) != 6) return 0;
+        const long size = (long) le32(h);
+        if (size < 8 || size > end - o) return 0;
+        if (le16(h + 4) == 8)
+        {
+            if (size < 20 + (long) sizeof(h)) return 0;
+            if (fos_port_seek(f, (int) (o + 20)) < 0 || fos_port_read(f, h, sizeof(h)) != (int) sizeof(h)) return 0;
+            int cnt = 0;
+            const long v = tiff_value(h, sizeof(h), 0x4001, &cnt);
+            if (v < 0 || v + 150 > (long) sizeof(h) || cnt < 75 || le16(h + v) != 17) return 0;
+            const float red = le16(h + v + 142), green = le16(h + v + 144), blue = le16(h + v + 148);
+            if (green <= 0 || red < green / 4 || red > green * 8 || blue < green / 4 || blue > green * 8) return 0;
+            *r = red / green;
+            *b = blue / green;
+            return 1;
+        }
+        o += size;
+    }
+    return 0;
 }
 
 int fos_cr3_parse(void *f, struct fos_cr3 *c, const char **why)

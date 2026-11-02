@@ -20,10 +20,13 @@ struct fos_cr3
     int tile_w, tile_h;                 /* in the mosaic */
     int version, bits, planes, cfa, enc, levels;
     int hdr_offset, hdr_size;           /* the CRX header, then the tiles */
+    int ctmd_offset, ctmd_size;         /* the frame's metadata track */
 };
 
 /* 1: read; 0: not a CR3 at all; < 0: a CR3 that can't be used (see *why) */
 int fos_cr3_parse(void *f, struct fos_cr3 *c, const char **why);
+/* the white balance of the shot, red and blue against green; 0: the file doesn't say */
+int fos_cr3_white(void *f, const struct fos_cr3 *c, float *r, float *b);
 
 /* a decoded line: mosaic columns x0, x0 + 2, ... of mosaic row y */
 struct fos_crx_line

@@ -101,7 +101,7 @@ class EosRPatchTests(unittest.TestCase):
 #define NotifyBox(timeout, ...) snprintf(notice, sizeof(notice), __VA_ARGS__)
 #define dbg(...) ((void)0)
 static char notice[192];
-static struct fos_film stock = { .picstyle = PS_STANDARD, .iso = 400, .kelvin = 5500, .wbs_ba = 2, .wbs_gm = -1 };
+static struct fos_film stock = { .key = "gold200", .picstyle = PS_STANDARD, .iso = 400, .kelvin = 5500, .wbs_ba = 2, .wbs_gm = -1 };
 const struct fos_film *fos_films = &stock;
 int fos_nfilms = 1;
 static int acknowledged, writes;
@@ -125,6 +125,13 @@ int main(void) {
     assert(strstr(notice, "BA 2 GM -1") != 0);
     /* NotifyBox draws one unwrapped line of large text */
     assert(strlen(notice) <= 44);
+    /* Portra 400 develops at the shot's white balance: nothing may ask for another one */
+    stock.key = "portra400";
+    apply_film(0);
+    assert(strstr(notice, "ISO 400") != 0 && strstr(notice, "5500") == 0 && strstr(notice, "BA") == 0);
+    assert(strlen(notice) <= 44);
+    writes = 4;
+    stock.key = "gold200";
     stock.picstyle = PS_MONO;
     apply_film(0);
     assert(writes == 6);

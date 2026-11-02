@@ -231,6 +231,13 @@ FOS_INLINE int cin_pos(const uint16_t *cin, int lin)
     return cin[lin < 4096 ? lin : lin > 65535 ? 4096 + 3840 : 4096 + ((lin - 4096) >> 4)];
 }
 
+#ifdef FOS_CR3
+/* The EOS R's Portra 400 (films/eos_r): the shot's white balance, a quarter of the
+ * scanner's correction, and its own table, marked so another table isn't taken for it. */
+#define TUNED_MARK 0x46u
+static int tuned(const struct fos_look *f) { return !strcmp(f->key, "portra400"); }
+#endif
+
 /* the look's numbers, so a table on the card is only used for the same look */
 /* the look's numbers and its film, so a table on the card is only used
  * for the same look (tools/genfilms.py works it out the same way for the
@@ -242,6 +249,9 @@ static uint32_t look_hash(const struct fos_look *f)
     uint32_t h = 2166136261u ^ (GRID * 256 + LOOK_MODEL);
     for (const char *k = f->key; *k; k++) h = (h ^ (uint8_t) *k) * 16777619u;
     for (; p < e; p++) h = (h ^ *p) * 16777619u;
+#ifdef FOS_CR3
+    if (tuned(f)) h ^= TUNED_MARK;
+#endif
     return h;
 }
 
@@ -297,6 +307,14 @@ static __attribute__((noinline)) int lut_build(const struct fos_look *f, int fil
         }
     }
     if (lut_built < NGRID) return 0;
+#ifdef FOS_CR3
+    if (tuned(f))
+    {
+        /* made from the plain look, so never kept in its table's place */
+        fos_port_log("dev: this film's table isn't on the card: copy ML/DARKROOM from the build");
+        return 1;
+    }
+#endif
     lut_save(f, film);
     return 1;
 }
@@ -398,6 +416,8 @@ struct fos_dev
     uint32_t **row_ptr;                 /* where each row's sums are, then its light, then its colour */
     uint32_t key_hist[4097];
     int spent[4], read_ms, logged;      /* ms working: decoding, film, JPEG, print; reading the card */
+    float shot[2];                      /* the shot's white balance, red and blue against green; 0: unknown */
+    uint8_t *film_grain;                /* the tuned film's tiles (GRAIN.BIN) */
 #endif
     int clrs, wide, high, bits, psv;
     struct huff *huff[4];
@@ -605,6 +625,7 @@ static int parse_cr3(struct fos_dev *d)
     const char *why = 0;
     int r = fos_cr3_parse(d->f, &c, &why);
     if (r <= 0) return r < 0 ? fail(d, why) : 0;
+    fos_cr3_white(d->f, &c, &d->shot[0], &d->shot[1]);
     d->crx = fos_crx_open(d->f, &c, &why);
     if (!d->crx) return fail(d, why);
     d->orient = c.orient;
@@ -1459,6 +1480,16 @@ static void setup_colour(struct fos_dev *d)
     }
     float green = pre[1];
     for (int i = 0; i < 3; i++) pre[i] /= green;
+#ifdef FOS_CR3
+    if (tuned(d->look) && d->shot[0] > 0)
+    {
+        pre[0] = d->shot[0];
+        pre[2] = d->shot[1];
+#ifdef FOS_DEV_TEST
+        fprintf(stderr, "as shot: %.4f %.4f\n", (double) pre[0], (double) pre[2]);
+#endif
+    }
+#endif
     /* rgb_cam = inverse(cam_rgb) */
     float (*m)[3] = cam_rgb, inv[3][3];
     float det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
@@ -1789,6 +1820,9 @@ void fos_dev_free(struct fos_dev *d)
     fos_port_free(d->buf); fos_port_free(d->rowoff); fos_port_free(d->seg_of);
     fos_port_free(d->seg_x0); fos_port_free(d->seg_off); fos_port_free(d->seg_desc); fos_port_free(d->desc_off); fos_port_free(d->seg_piece);
     fos_port_free(d->rowob); fos_port_free(d->colob); fos_port_free(d->ne_r); fos_port_free(d->ne_c);
+#ifdef FOS_CR3
+    fos_port_free(d->film_grain);
+#endif
     fos_port_free(d->sums); fos_port_free(d->glow); fos_port_free(d->rgb);
     fos_port_free(d->hist); fos_port_free(d->inv); fos_port_free(d->err_rows); fos_port_free(d->idx);
     fos_port_free(d);
@@ -1892,6 +1926,9 @@ static void stage_key(struct fos_dev *d)
 #endif
     }
     float k = exp2f(ev + d->look->ev);
+#ifdef FOS_CR3
+    if (tuned(d->look)) k = exp2f(ev * 0.25f);
+#endif
     float bal[3] = { 1, 1, 1 };
     if (d->look->balance != 5500)
     {
@@ -2131,7 +2168,70 @@ static __attribute__((noinline)) unsigned finish_grain(uint8_t *o, int n, unsign
 }
 
 #ifdef FOS_CR3
+/* film grain: a tile laid in 32-pixel blocks at random offsets, as AV1's film grain synthesis,
+ * its strength by brightness (films/eos_r). Tiles: luma, then (Cb, Cr) pairs, standard deviation 32;
+ * gain: the luma's standard deviation at mid grey, in 1/256 of a level. */
+#define GRAIN_TILE 128
+#define GRAIN_BYTES (2 * GRAIN_TILE * GRAIN_TILE + 256)
+
+static uint32_t grain_hash(int i, int j, uint32_t seed)
+{
+    uint32_t h = ((uint32_t) i * 0x9e3779b1u) ^ ((uint32_t) j * 0x85ebca77u) ^ seed;
+    h ^= h >> 15; h *= 0x2c1b3c6du; h ^= h >> 12; h *= 0x297a2d39u; h ^= h >> 15;
+    return h;
+}
+
+static __attribute__((noinline)) void finish_tile(uint8_t *o, int n, const uint8_t *tiles, int y, uint32_t seed, int gain)
+{
+    const int8_t *const luma = (const int8_t *) tiles, *const colour = luma + GRAIN_TILE * GRAIN_TILE;
+    const uint8_t *const tone = tiles + 2 * GRAIN_TILE * GRAIN_TILE;
+    for (int x = 0; x < n; )
+    {
+        const uint32_t h = grain_hash(x >> 5, y >> 5, seed);
+        const int8_t *const l = luma + (((h >> 0) + y) & 127) * GRAIN_TILE;
+        const int8_t *const c = colour + (((h >> 16) + y) & 127) * GRAIN_TILE;
+        const int lx = (int) (h >> 8) & 127, cx = (int) (h >> 24) & 63;
+        const int end = (x | 31) + 1 < n ? (x | 31) + 1 : n;
+        for (; x < end; x++, o += 3)
+        {
+            const int r = o[0], g = o[1], b = o[2];
+            const int a = (gain * tone[(r * 77 + g * 150 + b * 29) >> 8]) >> 7;
+            const int dy = (l[(lx + x) & 127] * a) >> 13;
+            const int8_t *const pair = c + 2 * ((cx + (x >> 1)) & 63);
+            const int a2 = (a * 90) >> 8;       /* colour: 0.35 of the luma's */
+            const int cb = (pair[0] * a2) >> 13, cr = (pair[1] * a2) >> 13;
+            const int v0 = r + dy + ((cr * 359) >> 8);
+            const int v1 = g + dy - ((cb * 88 + cr * 183) >> 8);
+            const int v2 = b + dy + ((cb * 454) >> 8);
+            o[0] = (uint8_t) (v0 < 0 ? 0 : v0 > 255 ? 255 : v0);
+            o[1] = (uint8_t) (v1 < 0 ? 0 : v1 > 255 ? 255 : v1);
+            o[2] = (uint8_t) (v2 < 0 ? 0 : v2 > 255 ? 255 : v2);
+        }
+    }
+}
+#endif
+
+#ifdef FOS_CR3
 #pragma GCC pop_options
+
+static uint8_t *load_film_grain()
+{
+    char path[160];
+    uint8_t h[4];
+    if (!cache_dir[0]) return 0;
+    snprintf(path, sizeof(path), "%s/GRAIN.BIN", cache_dir);
+    void *fp = fos_port_open(path, 0);
+    if (!fp) return 0;
+    uint8_t *tiles = 0;
+    if (fos_port_read(fp, h, 4) == 4 && !memcmp(h, "FOG1", 4) && (tiles = fos_port_alloc(GRAIN_BYTES)) != 0
+        && fos_port_read(fp, tiles, GRAIN_BYTES) != GRAIN_BYTES)
+    {
+        fos_port_free(tiles);
+        tiles = 0;
+    }
+    fos_port_close(fp);
+    return tiles;
+}
 #endif
 
 /* row y of the print: vignette, halation, the film's table, grain */
@@ -2147,6 +2247,10 @@ static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
         for (int x = 0; x < pw; x++) { float t = 2.0f * x / (pw - 1) - 1; d->vig_x[x] = (int16_t) (0.06f * t * t * 4096); }
         for (int k = 0; k < H; k++) { float t = 2.0f * k / (H - 1) - 1; d->vig_y[k] = (int16_t) (0.06f * t * t * 4096); }
         for (int x = 0; x < W; x++) glow_pos(TO_PRINT(d, x), GW, &d->gx[x], &d->fx[x]);
+#ifdef FOS_CR3
+        if (tuned(L) && !d->film_grain && !(d->film_grain = load_film_grain()))
+            fos_port_log("dev: GRAIN.BIN isn't on the card: copy ML/DARKROOM from the build");
+#endif
     }
     int hal[3];
     for (int c = 0; c < 3; c++) hal[c] = d->glow ? (int) (L->halation * L->hal_tint[c] * 256) : 0;
@@ -2181,6 +2285,11 @@ static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
     int grain = (int) (L->grain * 255 * 0.55f * 256);
 #ifdef FOS_CR3
     if (W > FOS_PRINT_W) grain = W >= 2240 ? grain * 2 : grain * 3 / 2;     /* less softened by the downscale */
+    if (d->film_grain)
+    {
+        finish_tile(o + 3 * px0, pw, d->film_grain, y, d->seed, W >= 2240 ? 742 : W > FOS_PRINT_W ? 556 : 371);
+        return;
+    }
 #endif
     if (grain) d->seed = finish_grain(o + 3 * px0, pw, d->seed, grain, L->mono);
 }
