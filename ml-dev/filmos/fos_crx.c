@@ -825,16 +825,17 @@ static void other_start(struct fos_crx *x)
     x->other_mem = 0;
 }
 
-/* a plane's piece from the card, if one wants it */
-static void read_ahead(struct fos_crx *x)
+/* a plane's piece from the card, if one wants it: 1 if it did */
+static int read_ahead(struct fos_crx *x)
 {
     for (int i = 0; i < x->ntiles * x->c.planes; i++)
     {
         struct bits *s = &x->streams[i].bs;
         if (__atomic_load_n(&s->spare_n, __ATOMIC_ACQUIRE) != SPARE_EMPTY) continue;
         __atomic_store_n(&s->spare_n, read_piece(s, s->spare), __ATOMIC_RELEASE);
-        return;
+        return 1;
     }
+    return 0;
 }
 
 static int next_of_two(struct fos_crx *x, struct fos_crx_line *line)
@@ -845,10 +846,12 @@ static int next_of_two(struct fos_crx *x, struct fos_crx_line *line)
     const int n = x->taken_lines, slot = n % x->slots;
     for (;;)
     {
-        read_ahead(x);
         const int ready = __atomic_load_n(&x->ready[slot], __ATOMIC_ACQUIRE);
         if (ready == -(n + 1)) { x->err = "damaged CR3 data"; return -1; }
         if (ready == n + 1) break;
+        /* The planes want their pieces at about the same time, and a piece takes as long as
+         * dozens of lines: the lines waiting go first, or the other core would run out of room */
+        if (read_ahead(x)) continue;
         const int mine = line_claim(x);
         if (mine < 0) { x->rests++; return FOS_CRX_WAIT; }
         line_make(x, mine, 1);

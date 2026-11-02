@@ -856,7 +856,11 @@ void *fos_port_open(const char *path, int write)
  * an uncached buffer. Taken at start (card_buffer), while there is memory
  * for it: on a 5D Mark II, asked for only when the darkroom first read a
  * roll's log, it wasn't there, and every read came back empty (#10). */
+#ifdef CONFIG_R
+#define BOUNCE (128 * 1024)     /* a CR3 plane's whole piece in one read: READ_SIZE in fos_crx.c */
+#else
 #define BOUNCE (64 * 1024)
+#endif
 static uint8_t *bounce = 0;
 static int bounce_size = 0;
 

@@ -199,12 +199,13 @@ come first. The second core touches only memory: it takes the film's and the JPE
 and decodes the CR3's lines, while the first core does every card read and adds the lines
 to the print in their usual order. If the second core can't start, or there is no memory
 for it, the first does it all, with the same bytes. With Display off at 15 s, two frames of
-42.6 MB took 16.3 and 16.4 s: 6.1 s decoding (3.2 to 3.4 of it reading the card), 4.8 film,
-2.7 JPEG, 1.0 print, with the second core on 14,071 of 18,184 lines. A 37.2 MB frame before
-decoding used the second core took 22.3 s, 11.5 of it decoding (2.9 reading the card). Those
-are not the same frames. A frame that began with the screen on took 24.5 s, 14.2 decoding,
-and its reads took twice as long. All three frames' JPEGs and prints from the camera are byte
-for byte what the PC makes, on one core or two.
+42.6 MB took 15.6 and 15.7 s: 5.1 and 5.3 s decoding (2.6 and 2.5 of it reading the card), 4.8
+film, 2.9 JPEG, 1.0 print, with the second core on about 14,900 of 18,184 lines. The steps add
+up to about 13.9 s; the rest is the darkroom's screen, still drawn while the display is off. A
+37.2 MB frame before decoding used the second core took 22.3 s, 11.5 of it decoding (2.9 reading
+the card). Those are not the same frames. A frame that began with the screen on took 23.4 s,
+13.0 decoding, and its reads took twice as long. The JPEGs and prints of those three frames from
+the camera are byte for byte what the PC makes, on one core or two.
 
 The JPEG is written in one go, so the screen
 pauses meanwhile. `autoexec.bin` of 362,784 bytes starts; the boot limit is unknown.
