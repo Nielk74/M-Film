@@ -5,8 +5,9 @@
 # M-Film
 
 > **EOS R development fork:** experimental source and build instructions are in
-> [EOS_R.md](EOS_R.md). The original EOS R has not been hardware-tested here;
-> CR3 film development is not implemented. Other cameras retain upstream behavior.
+> [EOS_R.md](EOS_R.md). It has booted on one original EOS R in one short test and
+> is still experimental; CR3 film development is not implemented. Other cameras
+> retain upstream behavior.
 
 **Your Canon, shot like film.**
 
