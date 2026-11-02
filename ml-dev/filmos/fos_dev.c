@@ -1388,6 +1388,7 @@ static int decode_crx(struct fos_dev *d, long n)
         int r = fos_crx_next(d->crx, &l);
         if (r < 0) return fail(d, fos_crx_error(d->crx));
         if (!r) { d->done = d->total; return 0; }
+        if (r == FOS_CRX_WAIT) { fos_port_sleep(1); return 0; }
         scatter_line(d, &l);
         d->crx_y = l.y;
         d->done += l.n;
@@ -2511,6 +2512,7 @@ int fos_dev_step(struct fos_dev *d, int budget_ms)
                     fos_port_close(d->f);
                     d->f = 0;
 #ifdef FOS_CR3
+                    fos_crx_log(d->crx);
                     d->read_ms = fos_crx_read_ms(d->crx);
                     fos_crx_close(d->crx); d->crx = 0;
 #endif

@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include "../fos.h"
 #include "../fos_dev.h"
 
@@ -21,12 +22,14 @@ int fos_port_ms()
     return (int) (t.tv_sec * 1000 + t.tv_nsec / 1000000);
 }
 /* As a camera short of memory would: FOS_ALLOC_MAX refuses any one block bigger,
- * FOS_ALLOC_TOTAL refuses big blocks (4 MB up) past that many bytes in all */
+ * FOS_ALLOC_TOTAL refuses big blocks (4 MB up) past that many bytes in all,
+ * FOS_ALLOC_HOLE (a-b) refuses blocks of those sizes */
 void *fos_port_alloc(int size)
 {
     static long big;
-    const char *max = getenv("FOS_ALLOC_MAX"), *total = getenv("FOS_ALLOC_TOTAL");
+    const char *max = getenv("FOS_ALLOC_MAX"), *total = getenv("FOS_ALLOC_TOTAL"), *hole = getenv("FOS_ALLOC_HOLE");
     if (max && size > atoi(max)) return 0;
+    if (hole && size >= atoi(hole) && size <= atoi(strchr(hole, '-') + 1)) return 0;
     if (size >= 4 * 1024 * 1024)
     {
         if (total && big + size > atol(total)) return 0;
@@ -39,6 +42,13 @@ void fos_port_sleep(int ms) {}
 void fos_port_log(const char *msg) { fprintf(stderr, "%s\n", msg); }
 void fos_port_free(void *p) { free(p); }
 
+/* FOS_SLOW_OTHER: microseconds the other core takes over each line, as when Canon's tasks hold it up */
+void fos_dev_test_other_line(void)
+{
+    const char *slow = getenv("FOS_SLOW_OTHER");
+    if (slow) usleep(atoi(slow));
+}
+
 /* the decoder's samples, to compare with mkcr2's */
 static uint16_t *raw;
 static int raw_w, raw_h;
@@ -46,6 +56,10 @@ static long bad, seen;
 
 void fos_dev_test_sample(int x, int y, int v)
 {
+    /* FOS_SLOW_LINES: microseconds a line takes in the print's sums, to hold up the first core */
+    static const char *slow;
+    if (!seen) slow = getenv("FOS_SLOW_LINES");
+    if (slow && !(seen % 1722)) usleep(atoi(slow));
     seen++;
     if (!raw) return;
     if (x >= raw_w || y >= raw_h || raw[(long) y * raw_w + x] != v)
@@ -95,7 +109,7 @@ void sim_films();             /* films.c */
 int main(int argc, char **argv)
 {
     sim_films();
-    int film = 0, a = 1, preview_at = 0;
+    int film = 0, a = 1, preview_at = 0, leave_at = 0;
     const char *rawpath = 0, *jpeg = 0;
     if (argc == 3 && !strcmp(argv[1], "-T"))
     {
@@ -127,6 +141,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[a], "-f")) film = film_index(argv[a + 1]);
         else if (!strcmp(argv[a], "-r")) rawpath = argv[a + 1];
         else if (!strcmp(argv[a], "-P")) preview_at = atoi(argv[a + 1]);
+        else if (!strcmp(argv[a], "-Q")) leave_at = atoi(argv[a + 1]);
         else if (!strcmp(argv[a], "-j")) jpeg = argv[a + 1];
     }
     if (argc - a < 2) { fprintf(stderr, "usage: devtest [-f film] [-r frame.u16] in.CR2 out.FOP [out.ppm]\n"
@@ -139,9 +154,17 @@ int main(int argc, char **argv)
     int t0 = fos_port_ms(), steps = 0, p = 0;
     struct fos_dev *d = fos_dev_start(argv[a], argv[a + 1], film, 1, "2026-10-22 17:45", "2.8");
     if (jpeg) fos_dev_jpeg(d, jpeg);
-    while ((p = fos_dev_step(d, preview_at ? 1 : 40)) >= 0 && p < 1000)
+    while ((p = fos_dev_step(d, preview_at || leave_at ? 1 : 40)) >= 0 && p < 1000)
     {
         steps++;
+        if (leave_at && p >= leave_at)
+        {
+            /* -Q n: leave at progress n, as a key does in the darkroom; a core still at it would show */
+            fos_dev_free(d);
+            usleep(100000);
+            printf("left at %d\n", p);
+            return 0;
+        }
         if (preview_at && p >= preview_at)
         {
             /* -P n: how much of the latent image is up at progress n */

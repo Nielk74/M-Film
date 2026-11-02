@@ -493,10 +493,47 @@ class SameOutputTests(unittest.TestCase):
             self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
             self.assertRegex(log, r"other core: [1-9]\d* of \d+ rows of film")
             self.assertRegex(log, r"other core: [1-9]\d* of \d+ rows of the JPEG")
+            self.assertRegex(log, r"other core: [1-9]\d* of 18184 lines of decoding")
             alone, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {"FOS_ONE_CORE": "1"})
             self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
             self.assertRegex(alone, r"other core: 0 of \d+ rows of film")
             self.assertRegex(alone, r"other core: 0 of \d+ rows of the JPEG")
+            self.assertRegex(alone, r"other core: 0 of 18184 lines of decoding")
+
+    def test_decoding_on_two_cores_copes_with_a_slow_card_and_a_busy_first_core(self):
+        result = run("make", "-C", SIM, "-j4", "out/devtest-r")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            install_tables(work / "tables")
+            (work / "wide.CR3").write_bytes(sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes())
+            # the second core has to wait for the card...
+            log, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {"FOS_SLOW_CARD": "20000"})
+            self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
+            self.assertRegex(log, r"other core: [1-9]\d* of 18184 lines of decoding.*waited [1-9]\d* for the card")
+            # ...and for the first core, which does the card and the print's sums, to make room
+            log, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {"FOS_SLOW_LINES": "500"})
+            self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
+            self.assertRegex(log, r"other core: [1-9]\d* of 18184 lines of decoding.*[1-9]\d* for room")
+            # ...and when it is the one held up, the first core does the rest
+            log, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {"FOS_SLOW_OTHER": "3000"})
+            self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
+            other = int(re.search(r"other core: (\d+) of 18184 lines of decoding", log).group(1))
+            self.assertGreater(other, 0)
+            self.assertLess(other, 18184 // 2)
+
+    def test_short_of_memory_for_two_cores_decoding_stays_on_one(self):
+        result = run("make", "-C", SIM, "-j4", "out/devtest-r")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            install_tables(work / "tables")
+            (work / "wide.CR3").write_bytes(sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes())
+            # every size of the block it asks for, and nothing else the frame needs
+            log, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {"FOS_ALLOC_HOLE": "1060000-1300000"})
+            self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
+            self.assertRegex(log, r"other core: 0 of 18184 lines of decoding")
+            self.assertRegex(log, r"other core: [1-9]\d* of \d+ rows of film")
 
     def test_the_two_cores_share_nothing_unguarded(self):
         sources = ["devtest.c", "port_files.c", "films.c"] + [
@@ -510,21 +547,30 @@ class SameOutputTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             install_tables(work / "tables")
             (work / "wide.CR3").write_bytes(sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes())
-            # Whether it can start at all depends on where this run's memory fell: it says so at once
-            for _ in range(200):
-                done = subprocess.run(
-                    [str(binary), "-f", "portra400", "-j", str(work / "o.jpg"), str(work / "wide.CR3"), str(work / "o.FOP")],
-                    cwd=SIM, text=True, capture_output=True, timeout=590,
-                    env={**os.environ, "FOS_LUT_DIR": str(work / "tables"), "TSAN_OPTIONS": "halt_on_error=1 exitcode=66"})
-                if "unexpected memory mapping" not in done.stderr:
-                    break
-            else:
+            def develop(*args, **env):
+                # Whether it can start at all depends on where this run's memory fell: it says so at once,
+                # or dies before main without a word (an empty program does too). A real crash gets a report.
+                for _ in range(200):
+                    done = subprocess.run(
+                        [str(binary), *args, "-f", "portra400", "-j", str(work / "o.jpg"), str(work / "wide.CR3"), str(work / "o.FOP")],
+                        cwd=SIM, text=True, capture_output=True, timeout=590,
+                        env={**os.environ, "FOS_LUT_DIR": str(work / "tables"), "TSAN_OPTIONS": "halt_on_error=1 exitcode=66", **env})
+                    if "unexpected memory mapping" not in done.stderr and not (done.returncode == -11 and not done.stderr):
+                        return done
                 self.skipTest("ThreadSanitizer can't map its memory on this kernel")
+            done = develop()
             self.assertEqual(done.returncode, 0, done.stderr[:3000])
             self.assertNotIn("ThreadSanitizer", done.stderr)
             self.assertRegex(done.stderr, r"other core: [1-9]\d* of \d+ rows of film")
+            self.assertRegex(done.stderr, r"other core: [1-9]\d* of 18184 lines of decoding")
             self.assertEqual(sha256(work / "o.jpg")[:20], self.EXPECTED[0][3])
             self.assertEqual(sha256(work / "o.FOP")[:20], self.EXPECTED[0][4])
+            # a card that keeps it waiting, and leaving in the middle of a frame
+            for args, env in (([], {"FOS_SLOW_CARD": "20000"}), (["-Q", "300"], {})):
+                done = develop(*args, **env)
+                with self.subTest(args=args, env=env):
+                    self.assertEqual(done.returncode, 0, done.stderr[:3000])
+                    self.assertNotIn("ThreadSanitizer", done.stderr)
 
     def test_every_size_and_film_is_byte_identical(self):
         result = run("make", "-C", SIM, "-j4", "out/devtest-r")
@@ -619,6 +665,46 @@ class Cr3DamageTests(unittest.TestCase):
                 data[rng.randrange(low, high)] = rng.randrange(256)
             with self.subTest(trial=trial):
                 self.develop(bytes(data), f"bad{trial}.CR3")
+
+    def test_damage_ends_the_same_on_one_core_and_on_two(self):
+        # Damaged lines decode to something or stop with an error: the same something, the same error
+        rng = random.Random(8736)
+        coded = 0x32f058 + 216
+        cases = {f"cut{keep}": self.good[:keep] for keep in (3400000, 20000000)}
+        for trial in range(6):
+            data = bytearray(self.good)
+            for _ in range(1 + trial * 3):
+                data[rng.randrange(coded, coded + 25000000)] = rng.randrange(256)
+            cases[f"flip{trial}"] = bytes(data)
+        for name, data in cases.items():
+            path, ends = self.work / f"same{name}.CR3", []
+            path.write_bytes(data)
+            for env in ({}, {"FOS_ONE_CORE": "1"}, {"FOS_SLOW_CARD": "2000"}):
+                jpeg, print_ = self.work / f"same{name}.jpg", self.work / f"same{name}.FOP"
+                jpeg.unlink(missing_ok=True)
+                print_.unlink(missing_ok=True)
+                done = subprocess.run([str(self.work / "devtest-asan"), "-j", str(jpeg), str(path), str(print_)],
+                                      cwd=SIM, text=True, capture_output=True, timeout=300, env={**os.environ, **env})
+                self.assertNotIn("AddressSanitizer", done.stderr, name)
+                last = done.stderr.strip().splitlines()[-1] if done.returncode else ""
+                ends.append((done.returncode, last, sha256(jpeg) if jpeg.exists() else None,
+                             sha256(print_) if print_.exists() else None))
+            with self.subTest(case=name):
+                self.assertEqual(ends[1], ends[0])
+                self.assertEqual(ends[2], ends[0])
+
+    def test_leaving_in_the_middle_of_decoding_waits_for_the_other_core(self):
+        path = self.work / "leave.CR3"
+        path.write_bytes(self.good)
+        for at in (1, 100, 400, 790):
+            with self.subTest(at=at):
+                # It is held up inside a line, so a core not waited for would go on in memory given back
+                done = subprocess.run(
+                    [str(self.work / "devtest-asan"), "-Q", str(at), "-j", str(self.work / "leave.jpg"), str(path), str(self.work / "leave.FOP")],
+                    cwd=SIM, text=True, capture_output=True, timeout=300, env={**os.environ, "FOS_SLOW_OTHER": "5000"})
+                self.assertNotIn("AddressSanitizer", done.stderr)
+                self.assertEqual(done.returncode, 0, done.stderr[-500:])
+                self.assertIn("left at", done.stdout)
 
 
 class RollLogTests(unittest.TestCase):

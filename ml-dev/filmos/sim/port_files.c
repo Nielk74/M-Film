@@ -5,10 +5,17 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include "../fos.h"
 
 void *fos_port_open(const char *path, int write) { return fopen(path, write ? "wb" : "rb"); }
-int  fos_port_read(void *f, void *buf, int size) { return (int) fread(buf, 1, size, f); }
+/* FOS_SLOW_CARD: microseconds a read takes */
+int  fos_port_read(void *f, void *buf, int size)
+{
+    const char *slow = getenv("FOS_SLOW_CARD");
+    if (slow) usleep(atoi(slow));
+    return (int) fread(buf, 1, size, f);
+}
 int  fos_port_writes;
 int  fos_port_write(void *f, const void *buf, int size) { fos_port_writes++; return (int) fwrite(buf, 1, size, f); }
 int  fos_port_seek(void *f, int offset) { return fseek(f, offset, SEEK_SET); }

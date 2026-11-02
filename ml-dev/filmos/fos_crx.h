@@ -38,11 +38,14 @@ struct fos_crx_line
 struct fos_crx;
 
 struct fos_crx *fos_crx_open(void *f, const struct fos_cr3 *c, const char **why);
-/* 1: a line, top to bottom, each row's planes together; 0: the frame is done;
- * < 0: damaged (see fos_crx_error) */
+/* 1: a line, top to bottom, each row's planes together, good until the next call; 0: the frame is
+ * done; < 0: damaged (see fos_crx_error); FOS_CRX_WAIT: the other core has it, rest a moment.
+ * The first call starts the other core, if it and the memory can be had. */
+#define FOS_CRX_WAIT 2
 int fos_crx_next(struct fos_crx *x, struct fos_crx_line *line);
 int fos_crx_read_ms(const struct fos_crx *x);    /* the time spent reading the card */
+void fos_crx_log(struct fos_crx *x);             /* how much the other core did (EOS R) */
 const char *fos_crx_error(const struct fos_crx *x);
-void fos_crx_close(struct fos_crx *x);
+void fos_crx_close(struct fos_crx *x);           /* stops the other core, and waits for it */
 
 #endif

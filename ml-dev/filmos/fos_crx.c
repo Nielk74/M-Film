@@ -9,6 +9,7 @@
 
 #include "fos.h"
 #include "fos_crx.h"
+#include <stdio.h>
 #include <string.h>
 
 /* ML builds for size; this is the camera's hottest code, and only whole numbers */
@@ -16,6 +17,7 @@
 
 #define READ_SIZE   (128 * 1024)        /* each plane's, read ahead from the card */
 #define READ_TOTAL  (2 * 1024 * 1024)   /* in all, with many tiles */
+#define RING_LINES  64                  /* decoded and not yet taken, with two cores: see line_claim */
 
 static int be16(const uint8_t *p) { return p[0] << 8 | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t) p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -221,7 +223,15 @@ struct bits
     int left;                           /* bits in it */
     int failed;
     int read_ms;
+    /* with two cores, see refill */
+    uint8_t *spare;
+    int spare_n;                        /* atomic: what is in it, SPARE_ or its bytes */
+    int on_first_core;                  /* the core decoding it now may read the card */
+    const int *closing;                 /* atomic */
+    int waits;
 };
+
+enum { SPARE_EMPTY = 0, SPARE_END = -1, SPARE_FAILED = -2 };
 
 static void bits_start(struct bits *s, int offset, int size)
 {
@@ -233,20 +243,45 @@ static void bits_start(struct bits *s, int offset, int size)
     s->failed = 0;
 }
 
-/* 1 when there are more bytes in the buffer; a read that fails is noted */
-static __attribute__((noinline)) int refill(struct bits *s)
+/* the plane's next piece: its bytes, or SPARE_END, or SPARE_FAILED; only the first core touches the card */
+static int read_piece(struct bits *s, uint8_t *to)
 {
-    int n = s->file_left < s->cap ? s->file_left : s->cap;
-    if (n <= 0) return 0;
+    const int n = s->file_left < s->cap ? s->file_left : s->cap;
+    if (n <= 0) return SPARE_END;
     const int t0 = fos_port_ms();
-    if (fos_port_seek(s->f, s->file_pos) < 0 || fos_port_read(s->f, s->buf, n) != n)
-    {
-        s->failed = 1;
-        return 0;
-    }
+    if (fos_port_seek(s->f, s->file_pos) < 0 || fos_port_read(s->f, to, n) != n) return SPARE_FAILED;
     s->read_ms += fos_port_ms() - t0;
     s->file_pos += n;
     s->file_left -= n;
+    return n;
+}
+
+/* 1 when there are more bytes in the buffer; a read that fails is noted.
+ * With two cores the second may touch nothing but memory, so a plane has a second buffer: the
+ * first core keeps it filled ahead (read_ahead), and this swaps to it. The pieces are the same
+ * as with one buffer, and so is what happens when they run out or can't be read. */
+static __attribute__((noinline)) int refill(struct bits *s)
+{
+    int n;
+    if (!s->spare) n = read_piece(s, s->buf);
+    else
+    {
+        while ((n = __atomic_load_n(&s->spare_n, __ATOMIC_ACQUIRE)) == SPARE_EMPTY)
+        {
+            if (s->on_first_core) __atomic_store_n(&s->spare_n, read_piece(s, s->spare), __ATOMIC_RELEASE);
+            else if (__atomic_load_n(s->closing, __ATOMIC_ACQUIRE)) { s->failed = 1; return 0; }
+            else s->waits++;
+        }
+    }
+    if (n == SPARE_FAILED) s->failed = 1;
+    if (n <= 0) return 0;
+    if (s->spare)
+    {
+        uint8_t *const was = s->buf;
+        s->buf = s->spare;
+        s->spare = was;
+        __atomic_store_n(&s->spare_n, SPARE_EMPTY, __ATOMIC_RELEASE);
+    }
     s->pos = 0;
     s->len = n;
     return 1;
@@ -570,6 +605,7 @@ struct stream
 {
     struct bits bs;
     struct band band;
+    int lines_made;                     /* atomic: with two cores, see line_claim */
 };
 
 struct fos_crx
@@ -583,6 +619,15 @@ struct fos_crx
     uint16_t *out;
     int32_t *lines;
     uint8_t *buf;
+    int width;                          /* of the widest tile */
+    /* with two cores */
+    int asked, nlines, slots, taken_lines;
+    uint8_t *other_mem;
+    int *ready;                         /* atomic: a slot's line + 1; - that if it is damaged */
+    uint16_t *ring;
+    int next_line, room_from;           /* atomic: the next to decode, the first whose slot is in use */
+    int other_busy, closing, damaged;   /* atomic */
+    int other_lines, other_waits, rests;
 };
 
 static int fail_open(struct fos_crx *x, const char **why, const char *msg)
@@ -649,6 +694,7 @@ struct fos_crx *fos_crx_open(void *f, const struct fos_cr3 *c, const char **why)
     int width = 0;
     for (int i = 0; i < x->ntiles; i++)
         if (x->tiles[i].w > width) width = x->tiles[i].w;
+    x->width = width;
     const int nstreams = x->ntiles * c->planes, nlines = (width + 2) * 2;
     int cap = READ_TOTAL / nstreams;
     cap = (cap < READ_SIZE ? cap : READ_SIZE) & ~3;     /* whole words: see line_next */
@@ -665,6 +711,7 @@ struct fos_crx *fos_crx_open(void *f, const struct fos_cr3 *c, const char **why)
         st->bs.f = f;
         st->bs.buf = x->buf + i * cap;
         st->bs.cap = cap;
+        st->bs.closing = &x->closing;
         st->band.bs = &st->bs;
         st->band.lines = x->lines + i * nlines;
         bits_start(&st->bs, t->offset[i % c->planes], t->size[i % c->planes]);
@@ -673,20 +720,166 @@ struct fos_crx *fos_crx_open(void *f, const struct fos_cr3 *c, const char **why)
     return x;
 }
 
+static void line_out(const struct fos_crx *x, const int32_t *in, uint16_t *out, int n)
+{
+    const int bits = x->c.bits, median = 1 << (bits - 1), top = (1 << bits) - 1;
+    for (int i = 0; i < n; i++)
+    {
+        int v = median + in[i];
+        out[i] = (uint16_t) (v < 0 ? 0 : v > top ? top : v);
+    }
+}
+
+/* ---------------------------------------------------------------- with two cores */
+
+#ifdef CONFIG_R
+
+/* A plane's line needs only that plane's line before it, so while the frame comes out in its usual
+ * order the lines can be made on either core, as the JPEG's rows are: each core takes the next one
+ * as soon as it is free, into a slot of the ring. The first core also reads the card and takes the
+ * lines from the ring, so it does less of the decoding, and if the second is held up by Canon's
+ * tasks the first simply does more of it. */
+
+#ifdef FOS_DEV_TEST
+void fos_dev_test_other_line(void);
+#endif
+
+/* where line n of the frame is: the tile's row, the row in it, then across */
+static void line_at(const struct fos_crx *x, int n, int *tile, int *row, int *plane)
+{
+    const int across = x->cols * x->c.planes, rows_in_tile = x->tiles[0].h;
+    int tile_row = (n / across) / rows_in_tile;
+    if (tile_row >= x->tile_rows) tile_row = x->tile_rows - 1;
+    *row = n / across - tile_row * rows_in_tile;
+    *tile = tile_row * x->cols + (n % across) / x->c.planes;
+    *plane = n % x->c.planes;
+}
+
+/* the next line for this core to make; -1 there is none for now, -2 none are left */
+static int line_claim(struct fos_crx *x)
+{
+    int n = __atomic_load_n(&x->next_line, __ATOMIC_RELAXED);
+    if (n >= x->nlines || __atomic_load_n(&x->closing, __ATOMIC_ACQUIRE) || __atomic_load_n(&x->damaged, __ATOMIC_ACQUIRE)) return -2;
+    if (n >= __atomic_load_n(&x->room_from, __ATOMIC_ACQUIRE) + x->slots) return -1;
+    int tile, row, plane;
+    line_at(x, n, &tile, &row, &plane);
+    /* the other core may still be on this plane's line before */
+    if (__atomic_load_n(&x->streams[tile * x->c.planes + plane].lines_made, __ATOMIC_ACQUIRE) != row) return -1;
+    return __atomic_compare_exchange_n(&x->next_line, &n, n + 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED) ? n : -1;
+}
+
+static void line_make(struct fos_crx *x, int n, int first_core)
+{
+    int tile, row, plane;
+    line_at(x, n, &tile, &row, &plane);
+    struct stream *st = &x->streams[tile * x->c.planes + plane];
+    st->bs.on_first_core = first_core;
+    const int32_t *in = band_line(&st->band);
+#ifdef FOS_DEV_TEST
+    if (!first_core) fos_dev_test_other_line();
+#endif
+    if (in) line_out(x, in, x->ring + (n % x->slots) * x->width, x->tiles[tile].w);
+    else __atomic_store_n(&x->damaged, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&st->lines_made, row + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&x->ready[n % x->slots], in ? n + 1 : -(n + 1), __ATOMIC_RELEASE);
+}
+
+/* It touches memory and nothing else, at the camera's lowest priority: Canon's tasks come first */
+static void other_core(void *arg)
+{
+    struct fos_crx *x = arg;
+    for (;;)
+    {
+        const int n = line_claim(x);
+        if (n == -2) break;
+        if (n < 0) { x->other_waits++; continue; }
+        line_make(x, n, 0);
+        x->other_lines++;
+    }
+    __atomic_store_n(&x->other_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* Only now the memory is asked for: what the frame is developed at is settled by then, and it
+ * goes back before the film wants any. Without it, or without the core, one core does it as ever. */
+static void other_start(struct fos_crx *x)
+{
+    const int nstreams = x->ntiles * x->c.planes, cap = x->streams[0].bs.cap;
+    x->asked = 1;
+    x->nlines = 0;
+    for (int i = 0; i < x->tile_rows; i++) x->nlines += x->tiles[i * x->cols].h * x->cols * x->c.planes;
+    for (x->slots = RING_LINES; x->slots >= 8 && !x->other_mem; x->slots /= 2)
+    {
+        x->other_mem = fos_port_alloc(nstreams * cap + x->slots * (int) sizeof(int) + x->slots * x->width * (int) sizeof(uint16_t));
+        if (x->other_mem) break;
+    }
+    if (!x->other_mem) return;
+    x->ready = (int *) (x->other_mem + nstreams * cap);
+    x->ring = (uint16_t *) (x->ready + x->slots);
+    memset(x->ready, 0, x->slots * sizeof(int));
+    for (int i = 0; i < nstreams; i++) x->streams[i].bs.spare = x->other_mem + i * cap;
+    __atomic_store_n(&x->other_busy, 1, __ATOMIC_RELEASE);
+    if (fos_port_other_core(other_core, x)) return;
+    __atomic_store_n(&x->other_busy, 0, __ATOMIC_RELEASE);
+    for (int i = 0; i < nstreams; i++) x->streams[i].bs.spare = 0;
+    fos_port_free(x->other_mem);
+    x->other_mem = 0;
+}
+
+/* a plane's piece from the card, if one wants it */
+static void read_ahead(struct fos_crx *x)
+{
+    for (int i = 0; i < x->ntiles * x->c.planes; i++)
+    {
+        struct bits *s = &x->streams[i].bs;
+        if (__atomic_load_n(&s->spare_n, __ATOMIC_ACQUIRE) != SPARE_EMPTY) continue;
+        __atomic_store_n(&s->spare_n, read_piece(s, s->spare), __ATOMIC_RELEASE);
+        return;
+    }
+}
+
+static int next_of_two(struct fos_crx *x, struct fos_crx_line *line)
+{
+    /* the line handed out last has been used */
+    __atomic_store_n(&x->room_from, x->taken_lines, __ATOMIC_RELEASE);
+    if (x->taken_lines >= x->nlines) return 0;
+    const int n = x->taken_lines, slot = n % x->slots;
+    for (;;)
+    {
+        read_ahead(x);
+        const int ready = __atomic_load_n(&x->ready[slot], __ATOMIC_ACQUIRE);
+        if (ready == -(n + 1)) { x->err = "damaged CR3 data"; return -1; }
+        if (ready == n + 1) break;
+        const int mine = line_claim(x);
+        if (mine < 0) { x->rests++; return FOS_CRX_WAIT; }
+        line_make(x, mine, 1);
+    }
+    int tile, row, plane;
+    line_at(x, n, &tile, &row, &plane);
+    const struct tile *t = &x->tiles[tile];
+    line->v = x->ring + slot * x->width;
+    line->n = t->w;
+    line->x0 = 2 * t->x0 + (plane & 1);
+    line->y = 2 * (t->y0 + row) + (plane >> 1);
+    x->taken_lines = n + 1;
+    return 1;
+}
+#endif
+
+/* ---------------------------------------------------------------- */
+
 int fos_crx_next(struct fos_crx *x, struct fos_crx_line *line)
 {
+#ifdef CONFIG_R
+    if (!x->asked) other_start(x);
+    if (x->other_mem) return next_of_two(x, line);
+#endif
     if (x->tile_row >= x->tile_rows) return 0;
     const int tile = x->tile_row * x->cols + x->col;
     const struct tile *t = &x->tiles[tile];
     const int32_t *in = band_line(&x->streams[tile * x->c.planes + x->plane].band);
     if (!in) { x->err = "damaged CR3 data"; return -1; }
-    const int bits = x->c.bits, median = 1 << (bits - 1), top = (1 << bits) - 1;
     uint16_t *out = x->out;
-    for (int i = 0; i < t->w; i++)
-    {
-        int v = median + in[i];
-        out[i] = (uint16_t) (v < 0 ? 0 : v > top ? top : v);
-    }
+    line_out(x, in, out, t->w);
     /* planes 0..3 sit at R G / G B of the mosaic's 2 x 2 */
     line->v = out;
     line->n = t->w;
@@ -715,6 +908,21 @@ int fos_crx_read_ms(const struct fos_crx *x)
     return ms;
 }
 
+#ifdef CONFIG_R
+void fos_crx_log(struct fos_crx *x)
+{
+    /* the frame is done: it has nothing left to do but stop */
+    while (__atomic_load_n(&x->other_busy, __ATOMIC_ACQUIRE)) fos_port_sleep(1);
+    int card = 0, lines = 0;
+    for (int i = 0; i < x->tile_rows; i++) lines += x->tiles[i * x->cols].h * x->cols * x->c.planes;
+    for (int i = 0; i < x->ntiles * x->c.planes; i++) card += x->streams[i].bs.waits;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "dev: other core: %d of %d lines of decoding, it waited %d for the card, %d for room; the first rested %d times",
+             x->other_lines, lines, card, x->other_waits, x->rests);
+    fos_port_log(msg);
+}
+#endif
+
 const char *fos_crx_error(const struct fos_crx *x)
 {
     return x->err ? x->err : "damaged CR3 data";
@@ -723,6 +931,11 @@ const char *fos_crx_error(const struct fos_crx *x)
 void fos_crx_close(struct fos_crx *x)
 {
     if (!x) return;
+#ifdef CONFIG_R
+    __atomic_store_n(&x->closing, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&x->other_busy, __ATOMIC_ACQUIRE)) fos_port_sleep(1);
+    fos_port_free(x->other_mem);
+#endif
     fos_port_free(x->tiles);
     fos_port_free(x->streams);
     fos_port_free(x->lines);
