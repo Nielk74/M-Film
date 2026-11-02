@@ -232,10 +232,9 @@ FOS_INLINE int cin_pos(const uint16_t *cin, int lin)
 }
 
 #ifdef FOS_CR3
-/* The EOS R's Portra 400 (films/eos_r): the shot's white balance, a quarter of the
- * scanner's correction, and its own table, marked so another table isn't taken for it. */
+/* The EOS R's films (films/eos_r): the shot's white balance, a quarter of the scanner's
+ * correction, and their own tables, marked so another table isn't taken for one of them. */
 #define TUNED_MARK 0x46u
-static int tuned(const struct fos_look *f) { return !strcmp(f->key, "portra400"); }
 #endif
 
 /* the look's numbers, so a table on the card is only used for the same look */
@@ -250,7 +249,7 @@ static uint32_t look_hash(const struct fos_look *f)
     for (const char *k = f->key; *k; k++) h = (h ^ (uint8_t) *k) * 16777619u;
     for (; p < e; p++) h = (h ^ *p) * 16777619u;
 #ifdef FOS_CR3
-    if (tuned(f)) h ^= TUNED_MARK;
+    h ^= TUNED_MARK;
 #endif
     return h;
 }
@@ -308,15 +307,13 @@ static __attribute__((noinline)) int lut_build(const struct fos_look *f, int fil
     }
     if (lut_built < NGRID) return 0;
 #ifdef FOS_CR3
-    if (tuned(f))
-    {
-        /* made from the plain look, so never kept in its table's place */
-        fos_port_log("dev: this film's table isn't on the card: copy ML/DARKROOM from the build");
-        return 1;
-    }
-#endif
+    /* made from the plain look, so never kept in its table's place */
+    fos_port_log("dev: this film's table isn't on the card: copy ML/DARKROOM from the build");
+    return 1;
+#else
     lut_save(f, film);
     return 1;
+#endif
 }
 
 /* the film's table, into the cache now: the build puts every film's on
@@ -1481,7 +1478,7 @@ static void setup_colour(struct fos_dev *d)
     float green = pre[1];
     for (int i = 0; i < 3; i++) pre[i] /= green;
 #ifdef FOS_CR3
-    if (tuned(d->look) && d->shot[0] > 0)
+    if (d->shot[0] > 0)
     {
         pre[0] = d->shot[0];
         pre[2] = d->shot[1];
@@ -1925,10 +1922,12 @@ static void stage_key(struct fos_dev *d)
         fprintf(stderr, "scanner: key %.4f, %.3f EV; black %d/16, pre %d %d %d\n", (double) key, (double) ev, d->black16, d->pre[0], d->pre[1], d->pre[2]);
 #endif
     }
-    float k = exp2f(ev + d->look->ev);
 #ifdef FOS_CR3
-    if (tuned(d->look)) k = exp2f(ev * 0.25f);
-#endif
+    /* the film's own exposure and balance are in its table; a slide has no scanner */
+    float k = d->look->slide ? 1 : exp2f(ev * 0.25f);
+    float bal[3] = { 1, 1, 1 };
+#else
+    float k = exp2f(ev + d->look->ev);
     float bal[3] = { 1, 1, 1 };
     if (d->look->balance != 5500)
     {
@@ -1938,6 +1937,7 @@ static void stage_key(struct fos_dev *d)
         for (int c = 0; c < 3; c++) bal[c] = a[c] / b[c];
         for (int c = 0; c < 3; c++) bal[c] /= a[1] / b[1];
     }
+#endif
     for (int c = 0; c < 3; c++) d->mul[c] = (int) (k * bal[c] * 4096 + 0.5f);
 }
 
@@ -2172,7 +2172,9 @@ static __attribute__((noinline)) unsigned finish_grain(uint8_t *o, int n, unsign
  * its strength by brightness (films/eos_r). Tiles: luma, then (Cb, Cr) pairs, standard deviation 32;
  * gain: the luma's standard deviation at mid grey, in 1/256 of a level. */
 #define GRAIN_TILE 128
-#define GRAIN_BYTES (2 * GRAIN_TILE * GRAIN_TILE + 256)
+#define GRAIN_SET (2 * GRAIN_TILE * GRAIN_TILE + 256)
+#define GRAIN_BYTES (2 * GRAIN_SET)     /* fine, then coarse */
+#define GRAIN_GAIN 41222.2f             /* the look's grain -> gain: 0.018 is 742, 2.9 levels */
 
 static uint32_t grain_hash(int i, int j, uint32_t seed)
 {
@@ -2181,7 +2183,7 @@ static uint32_t grain_hash(int i, int j, uint32_t seed)
     return h;
 }
 
-static __attribute__((noinline)) void finish_tile(uint8_t *o, int n, const uint8_t *tiles, int y, uint32_t seed, int gain)
+static __attribute__((noinline)) void finish_tile(uint8_t *o, int n, const uint8_t *tiles, int y, uint32_t seed, int gain, int mono)
 {
     const int8_t *const luma = (const int8_t *) tiles, *const colour = luma + GRAIN_TILE * GRAIN_TILE;
     const uint8_t *const tone = tiles + 2 * GRAIN_TILE * GRAIN_TILE;
@@ -2198,7 +2200,7 @@ static __attribute__((noinline)) void finish_tile(uint8_t *o, int n, const uint8
             const int a = (gain * tone[(r * 77 + g * 150 + b * 29) >> 8]) >> 7;
             const int dy = (l[(lx + x) & 127] * a) >> 13;
             const int8_t *const pair = c + 2 * ((cx + (x >> 1)) & 63);
-            const int a2 = (a * 90) >> 8;       /* colour: 0.35 of the luma's */
+            const int a2 = mono ? 0 : (a * 90) >> 8;    /* colour: 0.35 of the luma's */
             const int cb = (pair[0] * a2) >> 13, cr = (pair[1] * a2) >> 13;
             const int v0 = r + dy + ((cr * 359) >> 8);
             const int v1 = g + dy - ((cb * 88 + cr * 183) >> 8);
@@ -2248,12 +2250,18 @@ static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
         for (int k = 0; k < H; k++) { float t = 2.0f * k / (H - 1) - 1; d->vig_y[k] = (int16_t) (0.06f * t * t * 4096); }
         for (int x = 0; x < W; x++) glow_pos(TO_PRINT(d, x), GW, &d->gx[x], &d->fx[x]);
 #ifdef FOS_CR3
-        if (tuned(L) && !d->film_grain && !(d->film_grain = load_film_grain()))
+        if (!d->film_grain && !(d->film_grain = load_film_grain()))
             fos_port_log("dev: GRAIN.BIN isn't on the card: copy ML/DARKROOM from the build");
 #endif
     }
     int hal[3];
+#ifdef FOS_CR3
+    /* a table over Canon's tone lifts little light a long way: a strong glow would flare */
+    const float halation = L->halation > 1.5f ? 1.5f : L->halation;
+    for (int c = 0; c < 3; c++) hal[c] = d->glow ? (int) (halation * L->hal_tint[c] * 256) : 0;
+#else
     for (int c = 0; c < 3; c++) hal[c] = d->glow ? (int) (L->halation * L->hal_tint[c] * 256) : 0;
+#endif
     /* the glow between the grid's two rows about this one, in 1/8 */
     int32_t grow[GW];
     if (d->glow)
@@ -2287,7 +2295,12 @@ static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
     if (W > FOS_PRINT_W) grain = W >= 2240 ? grain * 2 : grain * 3 / 2;     /* less softened by the downscale */
     if (d->film_grain)
     {
-        finish_tile(o + 3 * px0, pw, d->film_grain, y, d->seed, W >= 2240 ? 742 : W > FOS_PRINT_W ? 556 : 371);
+        if (grain)
+        {
+            const int gain = (int) (L->grain * GRAIN_GAIN + 0.5f);
+            finish_tile(o + 3 * px0, pw, d->film_grain + (L->grain_size >= 1.3f ? GRAIN_SET : 0), y, d->seed,
+                        W >= 2240 ? gain : W > FOS_PRINT_W ? gain * 3 / 4 : gain / 2, L->mono);
+        }
         return;
     }
 #endif

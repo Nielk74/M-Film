@@ -260,14 +260,8 @@ static int iso_to_raw(int iso)
 static void manual_settings_prompt(int index)
 {
     const struct fos_film *f = &fos_films[COERCE(index, 0, fos_nfilms - 1)];
-    /* it develops at the shot's white balance (ml-dev/films/eos_r): any will do */
-    if (!strcmp(f->key, "portra400"))
-    {
-        NotifyBox(6000, "Canon menu: ISO %d, any WB", f->iso);
-        return;
-    }
-    NotifyBox(6000, "Canon menu: ISO %d, WB %dK, BA %d GM %d",
-              f->iso, f->kelvin, f->wbs_ba, f->wbs_gm);
+    /* the films develop at the shot's white balance (ml-dev/films/eos_r): any will do */
+    NotifyBox(6000, "Canon menu: ISO %d, any WB", f->iso);
 }
 
 /* NotifyBox shows one message: when the capture check's notice replaced

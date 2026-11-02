@@ -229,18 +229,18 @@ class BigJpegTests(unittest.TestCase):
 
 
 def install_tables(folder):
-    """The EOS R's own Portra 400 table and grain, as its build puts them on the card."""
+    """The EOS R's films, as its build puts them on the card; only those from recipes, unless folder has others."""
     folder.mkdir(exist_ok=True)
     result = run("python3", ROOT / "ml-dev/films/eos_r/install.py", folder)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
 
 
-class PortraTests(unittest.TestCase):
-    """The EOS R's Portra 400: the shot's white balance, a quarter of the scanner, its table."""
+class EosRFilmTests(unittest.TestCase):
+    """The EOS R's films: the shot's white balance, a quarter of the scanner, their tables, film grain."""
 
-    TABLE = "095f0b15e87e8afe"
-    GRAIN = "e973373be1a7b41e"
+    TABLES = {"portra400": "095f0b15e87e8afe", "gold200": "de1be4c0d476c648", "cinestill800t": "2a5ebccccc1addd8"}
+    GRAIN = "2f88be3d34f4444c"
 
     @classmethod
     def setUpClass(cls):
@@ -274,10 +274,11 @@ class PortraTests(unittest.TestCase):
         self.assertAlmostEqual(float(got.group(1)), r / g, places=3)
         self.assertAlmostEqual(float(got.group(2)), b / g, places=3)
 
-    def test_only_portra_takes_the_shots_white_balance(self):
-        result = self.develop("gold200")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("as shot:", result.stderr)
+    def test_every_film_takes_the_shots_white_balance(self):
+        for film in ("portra400", "cinestill800t", "velvia50", "hp5"):
+            result = self.develop(film)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("as shot:", result.stderr)
 
     def test_a_file_without_it_develops_at_daylight(self):
         # another version of Canon's colour data: its numbers may be elsewhere
@@ -289,10 +290,46 @@ class PortraTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("as shot:", result.stderr)
 
-    def test_the_table_is_the_approved_one(self):
-        table = ROOT / "ml-dev/films/eos_r/portra400.lut"
-        self.assertEqual(table.stat().st_size, 33 ** 3 * 3)
-        self.assertEqual(sha256(table)[:16], self.TABLE)
+    def test_the_tables_are_the_approved_ones(self):
+        for film, expected in self.TABLES.items():
+            table = ROOT / f"ml-dev/films/eos_r/{film}.lut"
+            self.assertEqual(table.stat().st_size, 33 ** 3 * 3, film)
+            self.assertEqual(sha256(table)[:16], expected, film)
+
+    def test_every_other_film_is_rebased_once(self):
+        # the plain tables, as the build mixes them for any camera
+        sources = ["devtest.c", "port_files.c", "films.c"] + [
+            f"../{n}.c" for n in ("fos_dev", "fos_print", "fos_looks", "fos_film", "fos_gfx", "fos_jpeg")]
+        plain = self.work / "devtest-plain"
+        result = run("gcc", "-O2", "-std=gnu99", "-DFOS_DEV_TEST", "-I..", *sources, "-lm", "-o", plain, cwd=SIM)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tables = self.work / "all"
+        tables.mkdir()
+        result = run(plain, "-T", tables, cwd=SIM)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(list(tables.glob("LOOK*.LUT"))), 72)
+        before = (tables / "LOOK02.LUT").read_bytes()
+        install_tables(tables)
+        after = (tables / "LOOK02.LUT").read_bytes()
+        self.assertNotEqual(before, after)
+        self.assertEqual(before[4:8], bytes(a ^ b for a, b in zip(after[4:8], b"\x46\0\0\0")))
+        install_tables(tables)
+        self.assertEqual((tables / "LOOK02.LUT").read_bytes(), after, "installing twice changes nothing")
+        for film, slide_or_mono in (("ektar100", ""), ("velvia50", "slide"), ("hp5", "mono"), ("kodak2383", "")):
+            with self.subTest(film=film):
+                result = self.develop(film, tables)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("isn't on the card", result.stdout + result.stderr)
+                picture = numpy.asarray(Image.open(self.work / "o.jpg").convert("RGB")).astype(int)
+                luma = picture.mean(axis=2)
+                # no film may come out flat, or without a white or a black
+                self.assertGreater(numpy.percentile(luma, 99), 170, film)
+                self.assertLess(numpy.percentile(luma, 2), 40, film)
+                colour = numpy.abs(picture[..., 0] - picture[..., 2]).mean()
+                if slide_or_mono == "mono":
+                    self.assertLess(colour, 1.5, film)
+                else:
+                    self.assertGreater(colour, 3, film)
 
     def test_the_card_table_is_used_and_an_old_one_is_not(self):
         tables = self.work / "tables"
@@ -314,7 +351,7 @@ class PortraTests(unittest.TestCase):
 
     def test_the_grain_is_the_cards_and_it_can_go_missing(self):
         grain = ROOT / "ml-dev/films/eos_r/grain.bin"
-        self.assertEqual(grain.stat().st_size, 2 * 128 * 128 + 256)
+        self.assertEqual(grain.stat().st_size, 2 * (2 * 128 * 128 + 256))
         self.assertEqual(sha256(grain)[:16], self.GRAIN)
         tables = self.work / "grain"
         install_tables(tables)
@@ -347,8 +384,8 @@ class SameOutputTests(unittest.TestCase):
     # from this PC's build and from emulated ARM.
     EXPECTED = [
         ("portra400", {}, False, "e95dde42a8fd9970d187", "879779158f1c98f1c95e"),
-        ("gold200", {}, False, "11fe93c1d274020367e3", "40bebf7bc36140659ca3"),
-        ("cinestill800t", {}, False, "ae3a332999e9ffe3fafc", "af40a97e6b2181dfd0de"),
+        ("gold200", {}, False, "12f4960c82920c907f5b", "435c328f26cdb3bdc471"),
+        ("cinestill800t", {}, False, "bdcb72bcbc3c3299dc48", "d01b781c7e921d4e3f13"),
         ("portra400", {}, True, "35b2b11abf87e7c6cc49", "e1722b837de9f3163418"),
         ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "f2e5b7f089fd1e979c25", None),
         ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "074b12159e5840622c37", None),

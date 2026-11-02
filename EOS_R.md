@@ -174,13 +174,13 @@ both frames' JPEG and print from the camera byte for byte. `test_cr3.py` holds e
 output to its exact bytes through speed work. A whole roll, memory over many frames and
 a vertical frame are untested there.
 
-Portra 400 on this body is its own (`ml-dev/films/eos_r/`): the shot's white balance,
+All 72 films on this body are its own (`ml-dev/films/eos_r/`): the shot's white balance,
 read from the CR3's metadata track, a quarter of the lab scanner's correction, a
-table over Canon's rendering, and film grain from a tile, so it isn't as warm or as
-flat as the other cameras'. On six frames from the test body, without grain, this
-code's JPEGs are byte for byte the version chosen by eye, and the white balance matches
-LibRaw on nine. It has not yet developed on the camera itself, and the other films
-still develop at a fixed daylight balance. A vertical frame comes out at 1493 x 2240.
+table over Canon's rendering, and film grain from a tile, so they aren't as warm or as
+flat as on other cameras. For Portra 400, without grain, this code's JPEGs on six frames
+from the test body are byte for byte the version chosen by eye, and the white balance
+matches LibRaw on nine frames. Each film was looked at on those frames, on a PC: none has
+yet developed on the camera with this. A vertical frame comes out at 1493 x 2240.
 
 The JPEG is written in one go, so the screen
 pauses meanwhile. `autoexec.bin` of 362,784 bytes starts; the boot limit is unknown.
