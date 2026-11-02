@@ -533,6 +533,179 @@ int main(void) {
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout.strip()
 
+    def test_a_scan_needs_few_listings_and_sees_every_print(self):
+        # On the test body, listings ran out part way through a scan: the print folders looked empty,
+        # no developed roll showed, and "develop all" went for every roll, oldest first.
+        with tempfile.TemporaryDirectory() as work:
+            card = Path(work)
+            folder = card / "DCIM/100EOS_R"
+            folder.mkdir(parents=True)
+            for roll in range(1, 9):
+                (folder / f"ROLL_{roll:03d}.TXT").write_text(
+                    f"roll = {roll:03d}\nfilm = portra400\nexposures = 36\nloaded = 2026-11-02 01:28:{roll:02d}\n\n"
+                    f"1  IMG_{roll:04d}.CR3  2026-11-02 01:29:13  f/2.8\n", encoding="ascii")
+                (folder / f"IMG_{roll:04d}.CR3").write_bytes(b"x")
+                if roll in (6, 7):
+                    continue            # shot, not developed
+                prints = card / f"ML/DARKROOM/R{roll:03d}"
+                prints.mkdir(parents=True)
+                (prints / "F01.BMP").write_bytes(b"x")
+                (prints / "SHEET.BMP").write_bytes(b"x")
+                out = card / f"DCIM/Nov1102 Film{roll}"
+                out.mkdir()
+                (out / f"ROLL{roll:03d}.TXT").write_bytes(b"x")
+                (out / f"IMG_{roll:04d}.JPG").write_bytes(b"x")
+            program = card / "lab.c"
+            program.write_text("""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fos.h"
+#include "fos_dev.h"
+void *fos_port_alloc(int n) { return malloc(n); }
+void fos_port_free(void *p) { free(p); }
+void fos_port_log(const char *m) { (void) m; }
+void fos_port_clock(char *b, int n) { snprintf(b, n, "00:00"); }
+void fos_port_roll(struct fos_roll *r) { memset(r, 0, sizeof(*r)); }
+void sim_films(void);
+int main(void) {
+    static struct fos_lab_roll r[48];
+    sim_films();
+    int n = fos_lab_scan(r, 48);
+    printf("rolls %d\\n", n);
+    for (int i = 0; i < n; i++)
+        if (!(r[i].sheet && r[i].developed >= r[i].shot && r[i].jpegs >= r[i].developed)) printf("waiting %d\\n", r[i].number);
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+            parent = SIM.parent
+            version = (ROOT / "VERSION").read_text().strip()
+            result = run("gcc", "-std=gnu99", "-O1", f'-DMFILM_VERSION="{version}"', "-DCONFIG_R", "-Wno-implicit-function-declaration",
+                         "-I", parent, "-I", SIM, program, SIM / "port_files.c", SIM / "films.c", parent / "fos_lab.c",
+                         parent / "fos_film.c", parent / "fos_gfx.c", parent / "fos_print.c", "-lm",
+                         "-o", card / "lab", cwd=SIM)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([str(card / "lab")], cwd=SIM, text=True, capture_output=True, timeout=60,
+                                    env={**os.environ, "FOS_CARD": str(card) + "/", "FOS_LIST_LIMIT": "3"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.split("\n")[0], "rolls 8", result.stdout)
+            self.assertEqual(sorted(line for line in result.stdout.split("\n") if line.startswith("waiting")),
+                             ["waiting 6", "waiting 7"], result.stdout)
+
+    def test_rolls_stay_known_and_up_to_date_when_listing_stops_working(self):
+        # On the test body, after developing, listing DCIM stopped finding the logs: rolls just
+        # developed stayed marked "to develop".
+        with tempfile.TemporaryDirectory() as work:
+            card = Path(work)
+            folder = card / "DCIM/100EOS_R"
+            folder.mkdir(parents=True)
+            for roll in (1, 2, 12):
+                (folder / f"ROLL_{roll:03d}.TXT").write_text(
+                    f"roll = {roll:03d}\nfilm = gold200\nexposures = 36\nloaded = 2026-11-02 01:28:{roll:02d}\n\n"
+                    f"1  IMG_{roll:04d}.CR3  2026-11-02 01:29:13  f/2.8\n", encoding="ascii")
+                (folder / f"IMG_{roll:04d}.CR3").write_bytes(b"x")
+            prints = card / "ML/DARKROOM/R012"
+            prints.mkdir(parents=True)
+            program = card / "lab.c"
+            program.write_text("""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fos.h"
+#include "fos_dev.h"
+void *fos_port_alloc(int n) { return malloc(n); }
+void fos_port_free(void *p) { free(p); }
+void fos_port_log(const char *m) { (void) m; }
+void fos_port_clock(char *b, int n) { snprintf(b, n, "00:00"); }
+void fos_port_roll(struct fos_roll *r) { memset(r, 0, sizeof(*r)); }
+void sim_films(void);
+static void show(const char *when) {
+    static struct fos_lab_roll r[48];
+    int n = fos_lab_scan(r, 48);
+    printf("%s rolls %d:", when, n);
+    for (int i = 0; i < n; i++) printf(" %d/%s/%d", r[i].number, fos_films[r[i].film].key, r[i].developed);
+    printf("\\n");
+}
+int main(int argc, char **argv) {
+    static struct fos_lab_frame f[FOS_MAX_FRAMES];
+    sim_films();
+    show("before");
+    for (int i = 0; i < 2; i++) {
+        char p[256];
+        snprintf(p, sizeof(p), "%sML/DARKROOM/R012/%s", getenv("FOS_CARD"), i ? "SHEET.BMP" : "F01.BMP");
+        FILE *o = fopen(p, "wb");
+        fputs("x", o);
+        fclose(o);
+    }
+    show("after");
+    printf("frames %d\\n", fos_lab_frames(12, f, FOS_MAX_FRAMES));
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+            parent = SIM.parent
+            version = (ROOT / "VERSION").read_text().strip()
+            result = run("gcc", "-std=gnu99", "-O1", f'-DMFILM_VERSION="{version}"', "-DCONFIG_R", "-Wno-implicit-function-declaration",
+                         "-I", parent, "-I", SIM, program, SIM / "port_files.c", SIM / "films.c", parent / "fos_lab.c",
+                         parent / "fos_film.c", parent / "fos_gfx.c", parent / "fos_print.c", "-lm",
+                         "-o", card / "lab", cwd=SIM)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            # enough listings for the first scan, then none
+            result = subprocess.run([str(card / "lab")], cwd=SIM, text=True, capture_output=True, timeout=60,
+                                    env={**os.environ, "FOS_CARD": str(card) + "/", "FOS_LIST_LIMIT": "2"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.strip().split("\n")
+            self.assertEqual(lines[0], "before rolls 3: 12/gold200/0 2/gold200/0 1/gold200/0", result.stdout)
+            self.assertEqual(lines[1], "after rolls 3: 12/gold200/1 2/gold200/0 1/gold200/0", result.stdout)
+            self.assertEqual(lines[2], "frames 1", result.stdout)
+
+    def test_a_rolls_folder_is_found_without_listing(self):
+        with tempfile.TemporaryDirectory() as work:
+            card = Path(work)
+            folder = card / "DCIM/100EOS_R"
+            folder.mkdir(parents=True)
+            for roll in (1, 2):
+                (folder / f"ROLL_{roll:03d}.TXT").write_text(
+                    f"roll = {roll:03d}\nfilm = gold200\nexposures = 36\nloaded = 2026-11-02 01:28:{roll:02d}\n\n"
+                    f"1  IMG_{roll:04d}.CR3  2026-11-02 01:29:13  f/2.8\n", encoding="ascii")
+            program = card / "lab.c"
+            program.write_text("""#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "fos.h"
+#include "fos_dev.h"
+void *fos_port_alloc(int n) { return malloc(n); }
+void fos_port_free(void *p) { free(p); }
+void fos_port_log(const char *m) { (void) m; }
+void fos_port_clock(char *b, int n) { snprintf(b, n, "00:00"); }
+void fos_port_roll(struct fos_roll *r) { memset(r, 0, sizeof(*r)); }
+void sim_films(void);
+int main(void) {
+    static struct fos_lab_roll r[48];
+    char d[128];
+    sim_films();
+    fos_lab_scan(r, 48);
+    for (int roll = 1; roll <= 2; roll++) {
+        int rc = fos_lab_dcim_dir(d, sizeof(d), roll, 3, "2026-11-02 01:29");
+        printf("%d %s\\n", rc, strrchr(d, '/') + 1);
+    }
+    int rc = fos_lab_dcim_dir(d, sizeof(d), 1, 3, "2026-11-02 01:29");
+    printf("%d %s\\n", rc, strrchr(d, '/') + 1);
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+            parent = SIM.parent
+            version = (ROOT / "VERSION").read_text().strip()
+            result = run("gcc", "-std=gnu99", "-O1", f'-DMFILM_VERSION="{version}"', "-DCONFIG_R", "-Wno-implicit-function-declaration",
+                         "-I", parent, "-I", SIM, program, SIM / "port_files.c", SIM / "films.c", parent / "fos_lab.c",
+                         parent / "fos_film.c", parent / "fos_gfx.c", parent / "fos_print.c", "-lm",
+                         "-o", card / "lab", cwd=SIM)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = subprocess.run([str(card / "lab")], cwd=SIM, text=True, capture_output=True, timeout=60,
+                                    env={**os.environ, "FOS_CARD": str(card) + "/", "FOS_LIST_LIMIT": "2"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip().split("\n"),
+                             ["0 Nov1102 Gold200", "0 Nov1102 Gold200 2", "0 Nov1102 Gold200"], result.stdout)
+            self.assertTrue((card / "DCIM/Nov1102 Gold200/ROLL001.TXT").exists())
+            self.assertTrue((card / "DCIM/Nov1102 Gold200 2/ROLL002.TXT").exists())
+
     def test_log_name_on_the_card_is_used(self):
         self.assertEqual(self.frames("IMG_8714.CR3", "IMG_8714.CR3"), "IMG_8714.CR3 missing=0")
 

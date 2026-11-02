@@ -179,8 +179,20 @@ read from the CR3's metadata track, a quarter of the lab scanner's correction, a
 table over Canon's rendering, and film grain from a tile, so they aren't as warm or as
 flat as on other cameras. For Portra 400, without grain, this code's JPEGs on six frames
 from the test body are byte for byte the version chosen by eye, and the white balance
-matches LibRaw on nine frames. Each film was looked at on those frames, on a PC: none has
-yet developed on the camera with this. A vertical frame comes out at 1493 x 2240.
+matches LibRaw on nine frames. Each film was looked at on those frames, on a PC. On the
+camera, CineStill 800T's JPEG and print came out byte for byte what the PC makes. A second
+developing run in one power-on then couldn't list the roll logs, for a reason not yet known,
+and blanked two contact sheets, and no developed roll showed. Part way through a power-on,
+listing folders first stops finding the logs, with no error, then fails outright, for a reason
+not yet known. On this body a folder is listed once, to find the logs, and all the rest is
+asked for by name; a roll whose log or JPEG folder can't be had is left as it is. Because is_dir
+lists too, folders that were there had looked missing and Canon's CreateDirectory made others
+of the same name, so whether a folder is there is now found by creating a file in it. Canon's power
+saving closed the darkroom about 190 s in, so "develop all" stopped after a roll or two:
+powersave_prohibit is a property write the whitelist refuses, so developing now carries on with
+the display off. Canon's Auto power off still ends it. Portra 400, Gold 200 and CineStill 800T
+have developed there, and their JPEGs and prints are byte for byte the PC's.
+A vertical frame comes out at 1493 x 2240.
 
 The JPEG is written in one go, so the screen
 pauses meanwhile. `autoexec.bin` of 362,784 bytes starts; the boot limit is unknown.

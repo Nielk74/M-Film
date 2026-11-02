@@ -745,13 +745,26 @@ int fos_port_key()
 
 int fos_port_abort()
 {
-    if (ui_abort || ml_shutdown_requested || !DISPLAY_IS_ON)
+    if (ui_abort || ml_shutdown_requested || get_halfshutter_pressed())
         return 1;
-    if (get_halfshutter_pressed())
+    static int mismatch_since = 0;
+#ifdef CONFIG_R
+    /* Canon's power saving turns the display off about 3 minutes in, and on this body it can't
+     * be held off (powersave_prohibit is a property write the whitelist refuses): developing
+     * goes on with the screen dark. 129 is the GUI mode seen as that happens. */
+    if (dev_busy && (!DISPLAY_IS_ON || CURRENT_GUI_MODE == 129))
+    {
+        static int told = 0;
+        if (!told) dbg("film os: display off (GUI mode %d): developing goes on", CURRENT_GUI_MODE);
+        told = 1;
+        mismatch_since = 0;
+        return 0;
+    }
+#endif
+    if (!DISPLAY_IS_ON)
         return 1;
     /* a Canon dialog took over (low battery, card door...): give the mode
      * request time to land, then let go if Canon keeps something else up */
-    static int mismatch_since = 0;
     int now = get_ms_clock();
     if (CURRENT_GUI_MODE == GUIMODE_ML_MENU)
         mismatch_since = 0;
@@ -898,7 +911,17 @@ int fos_port_list(const char *dir, int (*fn)(void *ctx, const char *name, int is
     if (len > 0 && len < (int) sizeof(path) - 1 && path[len - 1] != '/') strcat(path, "/");
     struct fio_file file;
     struct fio_dirent *d = FIO_FindFirstEx(path, &file);
-    if (IS_ERROR(d)) return -1;
+#ifdef CONFIG_R
+    static int listings;
+    listings++;
+#endif
+    if (IS_ERROR(d))
+    {
+#ifdef CONFIG_R
+        dbg("list: %s failed (%d), listing %d", path, (int) d, listings);
+#endif
+        return -1;
+    }
     int n = 0;
     do
     {
@@ -913,9 +936,22 @@ int fos_port_list(const char *dir, int (*fn)(void *ctx, const char *name, int is
 
 int fos_port_mkdir(const char *path)
 {
+#ifdef CONFIG_R
+    /* is_dir lists, and listing stops working part way through a power-on: folders that were
+     * there looked missing, and Canon's CreateDirectory makes another of the same name.
+     * FIO_CreateFile only makes the folder if the file can't be created. */
+    char probe[FIO_MAX_PATH_LENGTH];
+    snprintf(probe, sizeof(probe), "%s/MFILM.TMP", path);
+    void *f = FIO_CreateFile(probe);
+    if (!f) return -1;
+    FIO_CloseFile(f);
+    FIO_RemoveFile(probe);
+    return 0;
+#else
     if (is_dir(path)) return 0;
     FIO_CreateDirectory(path);
     return is_dir(path) ? 0 : -1;
+#endif
 }
 
 void *fos_port_alloc(int size)

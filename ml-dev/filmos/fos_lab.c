@@ -57,10 +57,36 @@ static void *open_by_number(struct fos_lab_frame *frame)
 }
 #endif
 
+#ifdef CONFIG_R
+/* Listing folders stops working on the test body, part way through a power-on, while files
+ * can still be opened by name. So it is used once, to find the folders with the logs, and
+ * everything else is asked for by name. (A folder Canon starts later shows after a restart.) */
+static int highest_roll;
+
+static int exists(const char *path)
+{
+    void *f = fos_port_open(path, 0);
+    if (f) fos_port_close(f);
+    return f != 0;
+}
+
+/* one of our folders: it holds a roll's tag file */
+static int dir_exists(const char *path)
+{
+    for (int number = 1; number <= highest_roll + 8; number++)
+    {
+        char tag[160];
+        snprintf(tag, sizeof(tag), "%s/ROLL%03d.TXT", path, number);
+        if (exists(tag)) return 1;
+    }
+    return 0;
+}
+#else
 static int dir_exists(const char *path)
 {
     return fos_port_list(path, first_only, 0) >= 0;
 }
+#endif
 
 /* a folder of ours: it holds the roll's tag file */
 static int tagged(const char *dir, int roll)
@@ -202,24 +228,47 @@ static void read_log(const char *path, const struct log_reader *r)
 /* every ROLL_nnn.TXT on the card: fn(ctx, folder, file name, roll number) */
 struct each_log { void (*fn)(void *ctx, const char *folder, const char *name, int number); void *ctx; const char *folder; };
 
+#ifdef CONFIG_R
+static char log_folders[4][16];
+static int n_log_folders, logs_found;
+static char first_seen[32];
+static int entries_seen;
+#endif
+
 static int log_entry(void *ctx, const char *name, int is_dir)
 {
     struct each_log *e = ctx;
     if (!is_dir && !strncmp(name, "ROLL_", 5) && strlen(name) == 12
         && (!strcmp(name + 8, ".TXT") || !strcmp(name + 8, ".txt")))
+    {
+#ifdef CONFIG_R
+        logs_found++;
+        if (atoi(name + 5) > highest_roll) highest_roll = atoi(name + 5);
+#endif
         e->fn(e->ctx, e->folder, name, atoi(name + 5));
+    }
     return 1;
 }
 
 static int folder_entry(void *ctx, const char *name, int is_dir)
 {
     struct each_log *e = ctx;
+#ifdef CONFIG_R
+    if (!entries_seen++) snprintf(first_seen, sizeof(first_seen), "%s%s", name, is_dir ? "/" : "");
+#endif
     /* DCIM folders: three digits and five characters, "100CANON" */
     if (!is_dir || strlen(name) != 8 || name[0] < '1' || name[0] > '9') return 1;
     char dir[64];
     snprintf(dir, sizeof(dir), "%sDCIM/%s", fos_port_card(), name);
     struct each_log sub = *e;
     sub.folder = name;
+#ifdef CONFIG_R
+    {
+        int known = 0;
+        for (int i = 0; i < n_log_folders; i++) known |= !strcmp(log_folders[i], name);
+        if (!known && n_log_folders < 4) snprintf(log_folders[n_log_folders++], sizeof(log_folders[0]), "%s", name);
+    }
+#endif
     fos_port_list(dir, log_entry, &sub);
     return 1;
 }
@@ -229,7 +278,31 @@ static void each_log(void (*fn)(void *, const char *, const char *, int), void *
     char dir[64];
     snprintf(dir, sizeof(dir), "%sDCIM", fos_port_card());
     struct each_log e = { fn, ctx, 0 };
+#ifdef CONFIG_R
+    if (!n_log_folders)
+    {
+        logs_found = entries_seen = 0;
+        first_seen[0] = 0;
+        int listed = fos_port_list(dir, folder_entry, &e);
+        if (logs_found) return;
+        char msg[96];
+        snprintf(msg, sizeof(msg), "lab: DCIM listed %d, %d entries seen, first %s, no logs", listed, entries_seen, first_seen);
+        fos_port_log(msg);
+    }
+    /* a little past the highest: the roll just loaded */
+    for (int i = 0; i < n_log_folders; i++)
+        for (int number = 1; number <= highest_roll + 8; number++)
+        {
+            char path[64], name[16];
+            snprintf(name, sizeof(name), "ROLL_%03d.TXT", number);
+            snprintf(path, sizeof(path), "%sDCIM/%s/%s", fos_port_card(), log_folders[i], name);
+            if (!exists(path)) continue;
+            if (number > highest_roll) highest_roll = number;
+            fn(ctx, log_folders[i], name, number);
+        }
+#else
     fos_port_list(dir, folder_entry, &e);
+#endif
 }
 
 /* ---------------------------------------------------------------- the catalogue */
@@ -318,20 +391,41 @@ int fos_lab_scan(struct fos_lab_roll *rolls, int max)
 {
     struct scan s = { rolls, 0, max, 0 };
     each_log(scan_log, &s);
+#ifdef CONFIG_R
+    if (!s.n) fos_port_log("lab: no roll logs found in DCIM");
+#endif
     struct fos_roll cam;
     fos_port_roll(&cam);
     for (int i = 0; i < s.n; i++)
     {
         struct fos_lab_roll *r = &rolls[i];
+#ifdef CONFIG_R
+        /* Listing folders ran out on the test body, part way through a scan, and every roll
+         * looked undeveloped: only the logs are listed, the prints are asked for by name.
+         * Its prints all came with their JPEGs. */
+        char path[64];
+        r->sheet = r->developed = 0;
+        fos_lab_print_path(path, sizeof(path), r->number, 0);
+        r->sheet = exists(path);
+        for (int f = 1; f <= r->shot && f <= FOS_MAX_FRAMES; f++)
+        {
+            fos_lab_print_path(path, sizeof(path), r->number, f);
+            r->developed += exists(path);
+        }
+        r->jpegs = r->developed;
+#else
         char dir[64];
         snprintf(dir, sizeof(dir), "%sML/DARKROOM/R%03d", fos_port_card(), r->number);
         fos_port_list(dir, print_entry, r);
+#endif
         r->in_camera = cam.loaded && cam.number == r->number;
     }
+#ifndef CONFIG_R
     char dcim[64];
     snprintf(dcim, sizeof(dcim), "%sDCIM", fos_port_card());
     struct jpeg_scan js = { rolls, s.n, -1, 0 };
     fos_port_list(dcim, jpeg_folder, &js);
+#endif
     /* newest first */
     for (int i = 1; i < s.n; i++)
         for (int j = i; j > 0; j--)

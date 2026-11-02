@@ -338,5 +338,182 @@ class FilmOsRegressionTests(unittest.TestCase):
                     self.assertEqual((dest / "devtest.FOP").read_bytes(), (dest / "devtest-arm.FOP").read_bytes())
 
 
+class DarkroomTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.src = Path(self.tmp.name)
+
+    def test_making_a_folder_never_trusts_a_listing(self):
+        # is_dir lists. When listing failed on the test body, existing folders looked missing and
+        # Canon's CreateDirectory made them again: six ML/DARKROOM on the card.
+        source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
+        function = c_function(source, "int fos_port_mkdir(const char *path)")
+        program = self.src / "mkdir.c"
+        program.write_text("""#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#define CONFIG_R
+#define FIO_MAX_PATH_LENGTH 128
+typedef int FILE_;
+static FILE_ a_file;
+static int dir_there, made, removed, listed, created;
+static int is_dir(const char *p) { listed++; return 0; }          /* listing is failing */
+static void FIO_CreateDirectory(const char *p) { made++; dir_there = 1; }
+/* as Magic Lantern's: makes the folder itself if it isn't there, and never another of it */
+static void *FIO_CreateFile(const char *p) { assert(strstr(p, "/")); if (!dir_there) { dir_there = 1; created++; } return &a_file; }
+static void FIO_CloseFile(void *f) {}
+static int FIO_RemoveFile(const char *p) { removed++; return 0; }
+""" + function + """
+int main(void) {
+    /* there already: nothing made, nothing left behind */
+    dir_there = 1;
+    assert(fos_port_mkdir("B:/ML/DARKROOM") == 0);
+    assert(made == 0 && created == 0 && removed == 1 && listed == 0);
+    /* not there: made once */
+    dir_there = 0;
+    assert(fos_port_mkdir("B:/ML/DARKROOM/R001") == 0);
+    assert(made == 0 && created == 1 && removed == 2 && listed == 0);
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+        binary = self.src / "mkdir"
+        result = run("gcc", "-std=gnu99", "-w", str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_developing_goes_on_when_canon_turns_the_display_off(self):
+        # On the test body Canon's power saving closed the darkroom about 190 s in, every run:
+        # only the first roll of "develop all" got done. It can't be stopped on this body
+        # (powersave_prohibit is a property write the whitelist refuses).
+        source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
+        function = c_function(source, "int fos_port_abort()")
+        program = self.src / "abort.c"
+        program.write_text("""#include <assert.h>
+#define CONFIG_R
+#define GUIMODE_ML_MENU 104
+#define dbg(...) ((void)0)
+static int ui_abort, ml_shutdown_requested, DISPLAY_IS_ON = 1, halfshutter, CURRENT_GUI_MODE = GUIMODE_ML_MENU, dev_busy, clock_ms = 1000;
+static int get_halfshutter_pressed(void) { return halfshutter; }
+static int get_ms_clock(void) { return clock_ms; }
+""" + function + """
+static int settled(void) { fos_port_abort(); clock_ms += 2000; return fos_port_abort(); }
+int main(void) {
+    assert(!fos_port_abort());
+    /* not developing: as ever */
+    DISPLAY_IS_ON = 0; assert(fos_port_abort()); DISPLAY_IS_ON = 1;
+    CURRENT_GUI_MODE = 129; assert(settled()); CURRENT_GUI_MODE = GUIMODE_ML_MENU; fos_port_abort();
+    /* developing: on through the display going off */
+    dev_busy = 1;
+    DISPLAY_IS_ON = 0; assert(!fos_port_abort()); DISPLAY_IS_ON = 1;
+    CURRENT_GUI_MODE = 129; assert(!settled());
+    /* but a half press stops it, and so does shutting down, and any other Canon screen */
+    halfshutter = 1; assert(fos_port_abort()); halfshutter = 0;
+    ml_shutdown_requested = 1; assert(fos_port_abort()); ml_shutdown_requested = 0;
+    CURRENT_GUI_MODE = 3; assert(settled());
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+        binary = self.src / "abort"
+        result = run("gcc", "-std=gnu99", "-w", str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_scan_that_finds_nothing_keeps_the_rolls_it_knew(self):
+        source = (ROOT / "ml-dev/filmos/fos_dark.c").read_text(encoding="utf-8")
+        function = c_function(source, "static void rescan()")
+        program = self.src / "rescan.c"
+        program.write_text("""#include <assert.h>
+#define CONFIG_R
+#define MAX_ROLLS 48
+struct fos_lab_roll { int number; };
+static struct { struct fos_lab_roll rolls[MAX_ROLLS]; } mem, *dm = &mem;
+#define rolls (dm->rolls)
+static int nrolls, found, logged;
+static int fos_lab_scan(struct fos_lab_roll *r, int max) { return found; }
+static void fos_port_log(const char *m) { logged++; }
+""" + function + """
+int main(void) {
+    found = 8; rescan(); assert(nrolls == 8);
+    found = 0; rescan(); assert(nrolls == 8 && logged == 1);
+    found = 3; rescan(); assert(nrolls == 3);
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+        binary = self.src / "rescan"
+        result = run("gcc", "-std=gnu99", "-w", str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_roll_whose_log_cant_be_read_keeps_its_contact_sheet(self):
+        # On the test body a second developing run couldn't list the roll logs: it found no
+        # frames and wrote blank contact sheets over two rolls.
+        source = (ROOT / "ml-dev/filmos/fos_dark.c").read_text(encoding="utf-8")
+        function = c_function(source, "static void next_job()")
+        program = self.src / "next_job.c"
+        program.write_text("""#include <assert.h>
+#include <stdio.h>
+#include <string.h>
+#include "fos.h"
+#include "fos_dev.h"
+#define CONFIG_R
+#define T_MDASH "-"
+#define FA_BUSY 1
+static struct { struct fos_lab_roll rolls[4]; int queue[4]; struct fos_lab_frame frames[FOS_MAX_FRAMES]; char paths[FOS_MAX_FRAMES][64]; } mem, *dm = &mem;
+#define rolls (dm->rolls)
+#define queue (dm->queue)
+static int nqueue, qi, nframes, fi, roll_ready, cur_roll, cur_film, cur_frame, panel_dirty, finished, failed_frames, done_frames, rolls_done;
+static char dcim_dir[128], last_error[72];
+static float ghost_t, ghost_final, frame_t0, ui_now;
+#define GHOST_W 1
+#define GHOST_H 1
+static unsigned char ghost[1];
+static struct fos_dev *dev;
+static int frames_found, sheets, prepared, no_folder, started;
+const struct fos_film *fos_films;
+static struct fos_film one;
+static int roll_index(int number) { return 0; }
+static int file_exists(const char *path) { return !no_folder; }
+int fos_lab_frames(int roll, struct fos_lab_frame *f, int max) { if (frames_found) { memset(f, 0, sizeof(*f)); f->no = 1; snprintf(f->cr2, sizeof(f->cr2), "IMG_1.CR3"); } return frames_found; }
+int fos_lab_prepare(int roll) { prepared++; return 0; }
+int fos_lab_dcim_dir(char *buf, int size, int roll, int film, const char *when) { if (no_folder) return -1; snprintf(buf, size, "d"); return 0; }
+void fos_lab_print_path(char *buf, int size, int roll, int frame) { snprintf(buf, size, "p%d", frame); }
+int fos_dev_sheet(const char *sheet, int film, const char *const *prints, int n) { sheets++; return 1; }
+void fos_port_log(const char *m) {}
+void fos_port_action(int a, int b, int c) {}
+struct fos_dev *fos_dev_start(const char *cr2, const char *print, int film, int frame, const char *when, const char *fstop) { started++; return 0; }
+void fos_dev_jpeg(struct fos_dev *d, const char *path) {}
+void fos_dev_release() {}
+""" + function + """
+int main(void) {
+    fos_films = &one;
+    nqueue = 1; queue[0] = 1;
+    frames_found = 0;
+    next_job();
+    assert(sheets == 0 && prepared == 0);
+    assert(failed_frames == 1 && rolls_done == 0 && finished == 1 && last_error[0]);
+    /* and a roll that can be read still gets its sheet */
+    qi = 0; finished = 0; roll_ready = 0;
+    frames_found = 1;
+    next_job();
+    assert(sheets == 1 && prepared == 1 && rolls_done == 1 && finished == 1);
+    /* no folder for its JPEGs: nothing is developed that would only half arrive */
+    qi = 0; finished = 0; roll_ready = 0; failed_frames = 0; sheets = 0;
+    no_folder = 1;
+    next_job();
+    assert(started == 0 && sheets == 0 && failed_frames == 1 && finished == 1);
+    return 0;
+}
+""", encoding="utf-8", newline="\n")
+        binary = self.src / "next_job"
+        result = run("gcc", "-std=gnu99", "-w", "-I", str(SIM.parent), str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

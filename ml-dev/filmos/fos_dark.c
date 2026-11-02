@@ -45,11 +45,21 @@ void dark_free()
 {
     fos_port_free(dm);
     dm = 0;
+#ifdef CONFIG_R
+    nrolls = 0;                         /* they were in it */
+#endif
 }
 
 static void rescan()
 {
+#ifdef CONFIG_R
+    /* nothing found, where there were rolls: the card couldn't be listed, they haven't gone */
+    int found = dm ? fos_lab_scan(rolls, MAX_ROLLS) : 0;
+    if (found || !dm) nrolls = found;
+    else if (nrolls) fos_port_log("darkroom: can't list the card now: keeping the rolls it knew");
+#else
     nrolls = dm ? fos_lab_scan(rolls, MAX_ROLLS) : 0;
+#endif
 }
 
 static int roll_index(int number)
@@ -200,6 +210,12 @@ static void dark_develop()
     for (int i = nrolls - 1; i >= 0; i--)
         if (is_waiting(&rolls[i]) && (!nm || marked[i]))
         {
+#ifdef CONFIG_R
+            char msg[96];
+            snprintf(msg, sizeof(msg), "darkroom: queue roll %03d: shot %d, %d prints, %d JPEGs, sheet %d", rolls[i].number,
+                     rolls[i].shot, rolls[i].developed, rolls[i].jpegs, rolls[i].sheet);
+            fos_port_log(msg);
+#endif
             if (finished_in_camera(&rolls[i])) fos_port_action(FA_REWIND, 0, 0);    /* out of the camera first */
             dark_queue_add(rolls[i].number);
         }
@@ -483,6 +499,18 @@ static void next_job()
                          fos_films[cur_film].key, nframes, raws);
                 fos_port_log(msg);
             }
+#ifdef CONFIG_R
+            if (nframes <= 0)
+            {
+                /* its log can't be read right now: nothing is known, so nothing is touched,
+                 * above all not its contact sheet */
+                fos_port_log("darkroom: its log can't be read now: left as it is");
+                snprintf(last_error, sizeof(last_error), "Can't read the rolls now " T_MDASH " restart the camera, try again");
+                failed_frames++;
+                qi++;
+                continue;
+            }
+#endif
             fos_lab_prepare(cur_roll);
             /* the roll's JPEGs go in DCIM, in a folder named for the day
              * its first frame was shot and the film */
@@ -493,6 +521,13 @@ static void next_job()
             {
                 dcim_dir[0] = 0;
                 fos_port_log("darkroom: no folder for the JPEGs in DCIM");
+#ifdef CONFIG_R
+                /* a print without its JPEG would look developed */
+                snprintf(last_error, sizeof(last_error), "No folder for the JPEGs " T_MDASH " restart the camera, try again");
+                failed_frames++;
+                qi++;
+                continue;
+#endif
             }
             else
             {

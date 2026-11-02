@@ -23,6 +23,10 @@ const char *fos_port_card()
 
 int fos_port_list(const char *dir, int (*fn)(void *ctx, const char *name, int is_dir), void *ctx)
 {
+    /* FOS_LIST_LIMIT: as a camera whose listings run out, which is what the test body seemed to do */
+    static int calls;
+    const char *limit = getenv("FOS_LIST_LIMIT");
+    if (limit && ++calls > atoi(limit)) return -1;
     DIR *d = opendir(dir);
     if (!d) return -1;
     struct dirent *e;
