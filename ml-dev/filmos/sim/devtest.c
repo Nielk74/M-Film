@@ -20,7 +20,20 @@ int fos_port_ms()
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (int) (t.tv_sec * 1000 + t.tv_nsec / 1000000);
 }
-void *fos_port_alloc(int size) { return malloc(size); }
+/* As a camera short of memory would: FOS_ALLOC_MAX refuses any one block bigger,
+ * FOS_ALLOC_TOTAL refuses big blocks (4 MB up) past that many bytes in all */
+void *fos_port_alloc(int size)
+{
+    static long big;
+    const char *max = getenv("FOS_ALLOC_MAX"), *total = getenv("FOS_ALLOC_TOTAL");
+    if (max && size > atoi(max)) return 0;
+    if (size >= 4 * 1024 * 1024)
+    {
+        if (total && big + size > atol(total)) return 0;
+        big += size;
+    }
+    return malloc(size);
+}
 int fos_port_dev_cap() { return 0; }
 void fos_port_log(const char *msg) { fprintf(stderr, "%s\n", msg); }
 void fos_port_free(void *p) { free(p); }
@@ -56,7 +69,8 @@ static int load_u16(const char *path)
     {
         /* mkcr2 --sensor: the other cameras' sensors (LibRaw's identify.cpp) */
         static const int other[][2] = { { 5568, 3708 }, { 5920, 3950 }, { 5792, 3804 }, { 5344, 3516 },
-                                        { 5360, 3516 }, { 4832, 3204 }, { 4832, 3228 }, { 4352, 2874 } };
+                                        { 5360, 3516 }, { 4832, 3204 }, { 4832, 3228 }, { 4352, 2874 },
+                                        { 6888, 4546 } /* EOS R, LibRaw's rawdump */ };
         for (unsigned i = 0; i < sizeof(other) / sizeof(other[0]); i++)
             if (n == (long) other[i][0] * other[i][1]) { raw_w = other[i][0]; raw_h = other[i][1]; }
     }
@@ -80,8 +94,8 @@ void sim_films();             /* films.c */
 int main(int argc, char **argv)
 {
     sim_films();
-    int film = 0, a = 1;
-    const char *rawpath = 0;
+    int film = 0, a = 1, preview_at = 0;
+    const char *rawpath = 0, *jpeg = 0;
     if (argc == 3 && !strcmp(argv[1], "-T"))
     {
         /* -T dir: every film's table into dir, as the camera keeps them */
@@ -111,6 +125,8 @@ int main(int argc, char **argv)
         if (a + 1 >= argc) break;
         if (!strcmp(argv[a], "-f")) film = film_index(argv[a + 1]);
         else if (!strcmp(argv[a], "-r")) rawpath = argv[a + 1];
+        else if (!strcmp(argv[a], "-P")) preview_at = atoi(argv[a + 1]);
+        else if (!strcmp(argv[a], "-j")) jpeg = argv[a + 1];
     }
     if (argc - a < 2) { fprintf(stderr, "usage: devtest [-f film] [-r frame.u16] in.CR2 out.FOP [out.ppm]\n"
                                         "       devtest -T dir    (the films' tables)\n"
@@ -121,7 +137,23 @@ int main(int argc, char **argv)
     if (getenv("FOS_LUT_DIR")) fos_dev_cache(getenv("FOS_LUT_DIR"));
     int t0 = fos_port_ms(), steps = 0, p = 0;
     struct fos_dev *d = fos_dev_start(argv[a], argv[a + 1], film, 1, "2026-10-22 17:45", "2.8");
-    while ((p = fos_dev_step(d, 40)) >= 0 && p < 1000) steps++;
+    if (jpeg) fos_dev_jpeg(d, jpeg);
+    while ((p = fos_dev_step(d, preview_at ? 1 : 40)) >= 0 && p < 1000)
+    {
+        steps++;
+        if (preview_at && p >= preview_at)
+        {
+            /* -P n: how much of the latent image is up at progress n */
+            enum { PW = 120, PH = 80 };
+            static uint8_t lum[PW * PH];
+            int left = 0, right = 0;
+            if (fos_dev_preview(d, lum, PW, PH))
+                for (int i = 0; i < PW * PH; i++)
+                    if (lum[i] != 255) { if (i % PW < PW / 2) left++; else right++; }
+            printf("preview at %d: %d left, %d right, of %d each\n", p, left, right, PW * PH / 2);
+            preview_at = 0;
+        }
+    }
     if (p < 0) { fprintf(stderr, "%s: %s\n", argv[a], fos_dev_error(d)); fos_dev_free(d); return 1; }
     printf("%s: %d ms, %d steps\n", argv[a], fos_port_ms() - t0, steps);
     fos_dev_free(d);

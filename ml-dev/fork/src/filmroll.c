@@ -68,7 +68,7 @@ static CONFIG_INT("filmroll.focus",     focus_screen,     1);
 static CONFIG_INT("filmroll.leds",      leds_on_half,     1);
 static CONFIG_INT("filmroll.wind",      wind_mode,        1);   /* 0 off, 1 reminder, 2 block shutter */
 #ifdef CONFIG_R
-static CONFIG_INT("filmroll.playlock",  play_lock,        0); /* CR3 prints need a computer */
+static CONFIG_INT("filmroll.playlock",  play_lock,        0); /* still experimental: keep Canon's playback */
 #else
 static CONFIG_INT("filmroll.playlock",  play_lock,        1);
 #endif
@@ -329,7 +329,13 @@ static void apply_film(int index)
 static int film_capture_check()
 {
     if (!roll_loaded) return 0;
+#ifdef CONFIG_R
+    /* its quality property is not the older cameras' (RAW+JPEG reads
+     * 0x4030700): the darkroom says so if a frame can't be developed */
+    int raw = 1;
+#else
     int raw = (pic_quality & 0xFE00FF) == (PICQ_RAW & 0xFE00FF);
+#endif
     int review_off = image_review_time == 0;
     if (raw && review_off) return 0;
     dbg("capture: quality %x, review %d", pic_quality, image_review_time);
@@ -351,6 +357,11 @@ static int current_fstop()
 {
     if (lens_is_manual())
         return COERCE(manual_fstop, lens_widest, fos_nfstops - 1);
+#ifdef CONFIG_R
+    /* not always reported here: below any real lens, and f/0.95 in the log */
+    if (lens_info.aperture < 9)
+        return COERCE(manual_fstop, lens_widest, fos_nfstops - 1);
+#endif
 
     int f100 = lens_info.aperture * 10;         /* lens_info.aperture is f x10 */
     int best = 0;
@@ -430,11 +441,14 @@ static void record_frame(int file_number)
     format_now(when, sizeof(when));
     fos_format_fstop(aperture, sizeof(aperture), current_fstop());
 #ifdef CONFIG_R
-    snprintf(line, sizeof(line), "%d  %s%04d.CR3  %s  f/%s\n",
+    /* get_file_prefix() reads wrong here ("495A"): the darkroom goes by the
+     * number if Canon's own name differs (_MG_, a custom prefix) */
+    snprintf(line, sizeof(line), "%d  IMG_%04d.CR3  %s  f/%s\n",
+             frames_shot, file_number, when, aperture);
 #else
     snprintf(line, sizeof(line), "%d  %s%04d.CR2  %s  f/%s\n",
-#endif
              frames_shot, get_file_prefix(), file_number, when, aperture);
+#endif
     log_append(line);
 
     for (int i = MIN(nrecent, FOS_RECENT - 1); i > 0; i--)

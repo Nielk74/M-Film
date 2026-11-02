@@ -16,4 +16,10 @@ struct fos_jpeg_meta
 int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, int height,
                    int quality, const struct fos_jpeg_meta *meta);
 
+#ifdef CONFIG_R
+/* the same from a frame in pieces: rows[y] + 3 * x0 is the row's first pixel */
+int fos_jpeg_write_rows(const char *path, void *const *rows, int x0, int width, int height,
+                        int quality, const struct fos_jpeg_meta *meta);
+#endif
+
 #endif

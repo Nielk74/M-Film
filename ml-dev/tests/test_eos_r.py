@@ -59,11 +59,18 @@ class EosRPatchTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertEqual(self.snapshot(), before)
 
-    def test_eos_r_rejects_cr2_darkroom_before_any_edits(self):
-        before = self.snapshot()
+    def test_eos_r_darkroom_links_the_cr3_decoder(self):
         result = self.patch("--experimental-eos-r")
-        self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        makefile = (self.src / "platform/R.180/Makefile").read_text(encoding="utf-8")
+        self.assertIn("fos_crx.o", makefile)
+        self.assertIn("fos_dev.o", makefile)
+
+    def test_eos_r_without_darkroom_has_no_cr3_decoder(self):
+        result = self.patch("--experimental-eos-r", "--no-darkroom")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        makefile = (self.src / "platform/R.180/Makefile").read_text(encoding="utf-8")
+        self.assertNotIn("fos_crx.o", makefile)
 
     def test_eos_r_rejects_old_picture_style_api_before_any_edits(self):
         (self.src / "src/picstyle.h").write_text("/* older ML API */\n", encoding="utf-8")
@@ -162,6 +169,75 @@ int main(void) {
         self.assertEqual(result.returncode, 0, result.stderr)
         result = run(str(binary))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_real_eos_r_quality_value_does_not_ask_for_raw(self):
+        # RAW+JPEG read 0x4030700 on a real EOS R: the older cameras' test
+        # took that for no RAW and put up a false notice.
+        source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
+        function = c_function(source, "static int film_capture_check()")
+        program = self.src / "capture_r_check.c"
+        program.write_text('''#include <assert.h>
+#include <stdio.h>
+#define CONFIG_R
+#define PICQ_RAW 0x4060000
+#define NotifyBox(timeout, ...) (notices++)
+#define dbg(...) ((void)0)
+static int roll_loaded = 1, pic_quality = 0x4030700, image_review_time, notices;
+''' + function + '''
+int main(void) {
+    (void) pic_quality;
+    assert(film_capture_check() == 0 && notices == 0);
+    image_review_time = 2;
+    assert(film_capture_check() == 1 && notices == 1);
+    return 0;
+}
+''', encoding="utf-8", newline="\n")
+        binary = self.src / "capture_r_check"
+        result = run("gcc", "-std=gnu99", "-Wall", "-Wextra", "-Werror", str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unknown_aperture_uses_the_dialled_one(self):
+        # A real EOS R logged f/0.95: lens_info.aperture stayed 0
+        source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
+        function = c_function(source, "static int current_fstop()")
+        program = self.src / "fstop_check.c"
+        program.write_text('''#include <assert.h>
+#define CONFIG_R
+#define ABS(x) ((x) < 0 ? -(x) : (x))
+#define COERCE(x, lo, hi) ((x) < (lo) ? (lo) : (x) > (hi) ? (hi) : (x))
+static const int fos_fstops[] = { 95, 100, 120, 140, 180, 200, 280 };
+enum { fos_nfstops = 7 };
+static struct { int aperture; } lens_info;
+static int manual_fstop = 4, lens_widest = 2, manual;
+static int lens_is_manual(void) { return manual; }
+''' + function + '''
+int main(void) {
+    lens_info.aperture = 0;
+    assert(current_fstop() == 4);
+    lens_info.aperture = 28;
+    assert(current_fstop() == 6);
+    manual = 1;
+    assert(current_fstop() == 4);
+    return 0;
+}
+''', encoding="utf-8", newline="\n")
+        binary = self.src / "fstop_check"
+        result = run("gcc", "-std=gnu99", "-Wall", "-Wextra", "-Werror", str(program), "-o", str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = run(str(binary))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_roll_log_names_the_file_without_mls_prefix_on_eos_r(self):
+        # get_file_prefix() read "495A" on a real EOS R; the file was IMG_8714.CR3
+        source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
+        function = c_function(source, "static void record_frame(int file_number)")
+        result = subprocess.run(["gcc", "-E", "-P", "-DCONFIG_R", "-x", "c", "-"], input=function, text=True,
+                                capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("get_file_prefix", result.stdout)
+        self.assertIn("IMG_%04d.CR3", result.stdout)
 
     def test_actual_display_dispatch_uses_all_256_colors_and_restores_ml_palette(self):
         result = self.patch("--experimental-eos-r", "--no-darkroom")

@@ -5,6 +5,10 @@
   *not* in this repository: the camera build (`ml-dev/films/getluts.py`) and Darkrooms download them from
   https://github.com/YahiaAngelo/Film-Luts. The camera's card files are made from them, though: the colour
   tables in `ML/DARKROOM` and the sample photos in `ML/SAMPLES`, so the notice below comes with them.
+- **LibRaw** (LGPL 2.1 or CDDL 1.0): `ml-dev/filmos/fos_crx.c`, the EOS R's CR3 decoder, follows the coding in
+  LibRaw's `src/decoders/crx.cpp` (Alexey Danilchenko, Alex Tutubalin), used here under the LGPL 2.1 terms that
+  allow it in this GPL-2.0 program; the format notes in https://github.com/lclevy/canon_cr3 helped too. LibRaw
+  also checks that decoder in the tests. https://www.libraw.org
 - **Barlow** font family (SIL Open Font License 1.1): `ml-dev/filmos/fonts/OFL.txt`.
 - Film names and box art are descriptive and made for this project; they are not affiliated with or endorsed
   by Kodak, Fujifilm, CineStill, Ilford, Agfa or others. "Canon" and "EOS M" are trademarks of Canon Inc.;

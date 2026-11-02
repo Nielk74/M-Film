@@ -22,8 +22,8 @@ EXPERIMENTAL_EOS_R = "--experimental-eos-r" in sys.argv[2:]
 
 # Reject an unsupported combination before touching the shared ML sources.
 if "R.180" in PLATFORMS:
-    if not EXPERIMENTAL_EOS_R or not NO_DARKROOM:
-        sys.exit("EOS R requires --experimental-eos-r --no-darkroom; see EOS_R.md")
+    if not EXPERIMENTAL_EOS_R:
+        sys.exit("EOS R requires --experimental-eos-r; see EOS_R.md")
     api = (root / "src/picstyle.h").read_text(encoding="utf-8")
     if "picstyle_set_current_contrast" not in api:
         sys.exit("EOS R needs the newer Picture Style API; use the revision pinned in build_eos_r.sh")
@@ -140,6 +140,8 @@ def platform(name):
     FOS_OBJS += ["fos_nodark"] if NO_DARKROOM else ["fos_dark", "fos_dev", "fos_lab", "fos_looks", "fos_jpeg"]
     if name == "R.180":
         FOS_OBJS += ["fos_rgba"]
+        if not NO_DARKROOM:
+            FOS_OBJS += ["fos_crx"]     # its RAWs are CR3s
     p = root / f"platform/{name}/Makefile"
     lines = p.read_text(encoding="utf-8").split("\n")
     out, skip = [], False

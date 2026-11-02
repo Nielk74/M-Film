@@ -14,8 +14,13 @@ experimental, and most of the checks under Hardware progression remain open.
 - The newer upstream Picture Style setters for preview contrast, sharpness,
   saturation and colour tone. These are the film's existing preview recipe,
   **not its complete film LUT, grain or halation**.
-- A CR3-aware unavailable-darkroom screen. The EOS M's CR2 decoder is not used
-  for EOS R photos. Copy CR3 files to a computer for development.
+- The in-camera darkroom, with a CR3 decoder for **RAW** frames (`fos_crx.c`). It
+  feeds the same film pipeline as the CR2 cameras: film colour, grain and halation.
+  The JPEG is 3360 x 2240, one pixel for each 2 x 2 of the mosaic (1493 x 2240 for a
+  vertical frame), and the print on the screen stays 720 x 480. Short of memory
+  it steps down to 2240 x 1494, 1620 x 1080, then 720 x 480, and logs the size used.
+  C-RAW frames are refused with a message: they use a wavelet coding this decoder
+  does not have yet. Shoot RAW.
 
 ISO, Kelvin white balance and WB shifts remain manual. Upstream does not allow
 those property writes on EOS R; this port does not expand its whitelist.
@@ -81,6 +86,12 @@ restoring ML's palette, patcher guards/idempotence, every existing scripted UI
 scene and synthetic CR2 decoding with native and ARM-style unaligned reads.
 They do not execute the camera's firmware, compositor or hardware.
 
+`test_cr3.py` needs `libraw-dev` and two real EOS R files from
+[raw.pixls.us](https://raw.pixls.us/data/Canon/EOS%20R/) (fetched once, hash
+checked, or from `FOS_CR3_DIR`). Every sensor sample of the RAW frame must match
+LibRaw's; truncated and corrupted files must be refused without overrunning a
+buffer under AddressSanitizer; other cameras' builds must not contain the decoder.
+
 ## Verification recorded on 2026-11-01
 
 - Stock EOS R core cross-compiles with ARM GCC 13.2.1.
@@ -145,7 +156,17 @@ shooting session. The boot memory limit is still unknown.
    Canon's shutter, and compare CR3 files to the roll log across a restart.
 6. Only after those checks, try the HUD and longer shooting sessions.
 
-CR3 decoding and full film development are subsequent work. A real EOS R CR3
-fixture and on-camera memory measurements are needed before designing that
-part. Do not mark EOS R as supported in the main camera table until hardware
-evidence justifies it.
+CR3 development ran on the test body at 720 x 480 (16 s a frame) and 1620 x 1080
+(21 s), its log clean, and every sample of a real frame from that body matched
+LibRaw. Its log also showed three faults the host tests could not: a wrong file
+prefix, a false "set RAW" notice and an unknown aperture, all now handled for this
+camera. That body refused single blocks of 90 MB and 40 MB (and 1620 x 1080 then took
+42 s, never explained), so a bigger frame now uses 8 MB pieces. In pieces, one frame
+developed there at 3360 x 2240: 80 s in all (34 s decoding, 24 film, 15 JPEG, 2 print)
+and a 1.7 MB JPEG, with all 11 pieces available. A whole roll, memory over many frames
+and a vertical frame are untested there. The JPEG is written in one go, so the screen
+pauses meanwhile. `autoexec.bin` of 359,904 bytes starts; the boot limit is unknown.
+`CRASH00.LOG` recorded one Canon `ImageController.c:981` assert in that testing, in
+LiveView after M-Film had closed and before any developing. Its cause is unknown.
+`WHITE_LEVEL` comes from LibRaw at ISO 100 (the test body's file gave 14448, not 14008). C-RAW is later work. Do not mark EOS R as supported in the main
+camera table until hardware evidence justifies it.

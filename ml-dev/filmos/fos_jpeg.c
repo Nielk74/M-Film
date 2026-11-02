@@ -279,8 +279,14 @@ static int exif(uint8_t *out, const struct fos_jpeg_meta *m)
 
 /* ---------------------------------------------------------------- the file */
 
+#ifdef CONFIG_R
+/* rows: a frame in pieces, each row's start; else rgb and its stride */
+static int jpeg_write(const char *path, const uint8_t *rgb, int stride, void *const *rows, int x0, int width, int height,
+                      int quality, const struct fos_jpeg_meta *meta)
+#else
 int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, int height,
                    int quality, const struct fos_jpeg_meta *meta)
+#endif
 {
     struct jw *w = fos_port_alloc(sizeof(struct jw));
     if (!w) return 0;
@@ -370,7 +376,12 @@ int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, 
                 int bx = mx + (b & 1) * 8, by = my + (b >> 1) * 8;
                 for (int y = 0; y < 8; y++)
                 {
+#ifdef CONFIG_R
+                    const int ry = by + y < height ? by + y : height - 1;
+                    const uint8_t *row = rows ? (const uint8_t *) rows[ry] + 3 * x0 : rgb + ry * stride;
+#else
                     const uint8_t *row = rgb + (by + y < height ? by + y : height - 1) * stride;
+#endif
                     for (int x = 0; x < 8; x++)
                     {
                         const uint8_t *px = row + 3 * (bx + x < width ? bx + x : width - 1);
@@ -395,3 +406,17 @@ int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, 
     fos_port_free(w);
     return ok;
 }
+
+#ifdef CONFIG_R
+int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, int height,
+                   int quality, const struct fos_jpeg_meta *meta)
+{
+    return jpeg_write(path, rgb, stride, 0, 0, width, height, quality, meta);
+}
+
+int fos_jpeg_write_rows(const char *path, void *const *rows, int x0, int width, int height,
+                        int quality, const struct fos_jpeg_meta *meta)
+{
+    return jpeg_write(path, 0, 0, rows, x0, width, height, quality, meta);
+}
+#endif

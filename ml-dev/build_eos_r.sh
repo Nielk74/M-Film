@@ -20,9 +20,10 @@ fi
 ML_TEST_SRC="$SRC" python3 -m unittest discover -s "$HERE/tests" -v
 
 cp "$HERE"/fork/src/filmroll.{c,h} "$HERE"/filmos/fos*.{c,h} "$SRC/src/"
+sed -i 's/\r$//' "$SRC"/src/filmroll.{c,h} "$SRC"/src/fos*.{c,h}
 VERSION=$(tr -d ' \r\n' < "$HERE/../VERSION")
 printf '#define MFILM_VERSION "%s-eos-r-experimental"\n' "$VERSION" > "$SRC/src/fos_version.h"
-python3 "$HERE/fork/apply_fork.py" "$SRC" R.180 --experimental-eos-r --no-darkroom
+python3 "$HERE/fork/apply_fork.py" "$SRC" R.180 --experimental-eos-r
 
 mkdir -p "$HERE/out"
 LOG="$HERE/out/eos-r-build.log"
@@ -37,7 +38,16 @@ cp "$SRC/platform/R.180/build/autoexec.bin" "$OUT/autoexec.bin"
 cp "$SRC"/data/fonts/*.rbf "$OUT/ML/fonts/"
 gcc -O2 -I"$HERE/filmos" -o "$HERE/out/eos-r-fontblob" "$HERE/filmos/tools/fontblob.c"
 "$HERE/out/eos-r-fontblob" "$OUT/ML/data/FOSFONT.BIN"
-python3 "$HERE/filmos/tools/genfilms.py" "$OUT/ML/data/FOSFILMS.BIN"
+F="$HERE/filmos"
+python3 "$F/tools/genfilms.py" "$OUT/ML/data/FOSFILMS.BIN"
+# every film's colour table, mixed from its look then baked from its LUT, as
+# in build_fork.sh: the darkroom would otherwise mix them itself, without the LUTs
+[ -d "$HERE/films/luts/filmluts" ] || python3 "$HERE/films/getluts.py"
+gcc -O2 -std=gnu99 -DFOS_DEV_TEST -I"$F" -o "$HERE/out/eos-r-devtest" "$F"/sim/devtest.c "$F"/sim/port_files.c \
+    "$F"/sim/films.c "$F"/fos_dev.c "$F"/fos_print.c "$F"/fos_looks.c "$F"/fos_film.c "$F"/fos_gfx.c "$F"/fos_jpeg.c -lm
+mkdir -p "$OUT/ML/DARKROOM"
+FOS_FILMS="$OUT/ML/data/FOSFILMS.BIN" "$HERE/out/eos-r-devtest" -T "$OUT/ML/DARKROOM"
+python3 "$F/tools/genfilms.py" "$OUT/ML/data/FOSFILMS.BIN" --tables "$OUT/ML/DARKROOM"
 # Never auto-open experimental UI at boot. A developer invokes Home with TRASH.
 printf 'filmroll.startup = 0\nfilmroll.bootanim = 0\nfilmroll.hud = 0\nfilmroll.playlock = 0\n' > "$OUT/ML/SETTINGS/magic.cfg"
 cp "$HERE/../EOS_R.md" "$OUT/EOS_R.md"

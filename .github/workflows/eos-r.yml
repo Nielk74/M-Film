@@ -17,12 +17,14 @@ jobs:
       - name: Install host and ARM tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends build-essential gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev python3-numpy python3-scipy python3-pil
+          sudo apt-get install -y --no-install-recommends build-essential gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi libnewlib-dev python3-numpy python3-scipy python3-pil libraw-dev
       - name: Get the pinned EOS R core
         run: |
           git clone --filter=blob:none https://github.com/reticulatedpines/magiclantern_simplified.git "$HOME/ml/magiclantern-r"
           git -C "$HOME/ml/magiclantern-r" checkout 142472e95054d73640f50789ac0fd66325499d82
       - name: Host tests and experimental ARM build
+        env:
+          FOS_CR3_REQUIRED: "1"
         run: bash ml-dev/build_eos_r.sh
       - uses: actions/upload-artifact@v4
         with:

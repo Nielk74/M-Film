@@ -27,6 +27,36 @@ void fos_lab_cache_dir(char *buf, int size)
 
 static int first_only(void *ctx, const char *name, int is_dir) { return 0; }
 
+#ifdef CONFIG_R
+/* The log's name may not be Canon's (a custom prefix, or a log from before
+ * the EOS R's prefix was fixed): the same number and type in that folder. */
+struct same_number { const char *tail; char found[32]; };
+
+static int number_entry(void *ctx, const char *name, int is_dir)
+{
+    struct same_number *s = ctx;
+    size_t n = strlen(name), t = strlen(s->tail);
+    if (is_dir || n != t + 4 || n >= sizeof(s->found) || strcmp(name + 4, s->tail)) return 1;
+    strcpy(s->found, name);
+    return 0;
+}
+
+static void *open_by_number(struct fos_lab_frame *frame)
+{
+    char *base = strrchr(frame->cr2, '/');
+    if (!base || strlen(base + 1) != 12) return 0;      /* PPPPnnnn.CR3 */
+    struct same_number s;
+    s.tail = base + 1 + 4;
+    s.found[0] = 0;
+    *base = 0;
+    fos_port_list(frame->cr2, number_entry, &s);
+    *base = '/';
+    if (!s.found[0]) return 0;
+    strcpy(base + 1, s.found);                          /* the same length */
+    return fos_port_open(frame->cr2, 0);
+}
+#endif
+
 static int dir_exists(const char *path)
 {
     return fos_port_list(path, first_only, 0) >= 0;
@@ -372,6 +402,9 @@ int fos_lab_frames(int roll, struct fos_lab_frame *frames, int max)
                 if (!f) *base = was;
             }
         }
+#ifdef CONFIG_R
+        if (!f) f = open_by_number(&frames[i]);
+#endif
         if (f) fos_port_close(f);
         else frames[i].missing = 1;
     }
