@@ -7,6 +7,11 @@
 #include "fos.h"
 #include <string.h>
 
+#ifdef CONFIG_R
+/* ML builds for size; these are big frames, and only whole numbers */
+#pragma GCC optimize ("O2")
+#endif
+
 /* ---------------------------------------------------------------- tables */
 
 static const uint8_t zigzag[64] =
@@ -379,6 +384,21 @@ int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, 
 #ifdef CONFIG_R
                     const int ry = by + y < height ? by + y : height - 1;
                     const uint8_t *row = rows ? (const uint8_t *) rows[ry] + 3 * x0 : rgb + ry * stride;
+                    if (bx + 8 <= width)
+                    {
+                        /* nearly every block: no edge to repeat */
+                        const uint8_t *px = row + 3 * bx;
+                        const int ck = ((b >> 1) * 4 + (y >> 1)) * 8 + (b & 1) * 4;
+                        int32_t *lum = blk + y * 8;
+                        for (int x = 0; x < 8; x++, px += 3)
+                        {
+                            const int r = px[0], g = px[1], bl = px[2];
+                            lum[x] = ((19595 * r + 38470 * g + 7471 * bl + 32768) >> 16) - 128;
+                            cb[ck + (x >> 1)] += -11059 * r - 21709 * g + 32768 * bl;
+                            cr[ck + (x >> 1)] += 32768 * r - 27439 * g - 5329 * bl;
+                        }
+                        continue;
+                    }
 #else
                     const uint8_t *row = rgb + (by + y < height ? by + y : height - 1) * stride;
 #endif

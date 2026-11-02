@@ -389,14 +389,15 @@ struct fos_dev
     int slices[3];
 #ifdef FOS_CR3
     struct fos_crx *crx;                /* a CR3: its planes come a line at a time */
-    int crx_x0, crx_x1, crx_plane, crx_y;   /* the tile it is in, where it has got to */
+    int crx_y;                          /* the raw row it has got to */
     int dev_w, dev_h;                   /* the size it is developed at */
     int banded;                         /* bigger than the print: in pieces, the finished rows over the sums */
+    int sums16;                         /* a pixel has at most 2 samples a colour: its sums fit 16 bits */
     void *pieces[MAX_PIECES];
     int npieces;
     uint32_t **row_ptr;                 /* where each row's sums are, then its light, then its colour */
     uint32_t key_hist[4097];
-    int spent[4], logged;               /* ms working: decoding, film, JPEG, print */
+    int spent[4], read_ms, logged;      /* ms working: decoding, film, JPEG, print; reading the card */
 #endif
     int clrs, wide, high, bits, psv;
     struct huff *huff[4];
@@ -744,8 +745,8 @@ static int refill(struct fos_dev *d, const uint8_t *bp, int keep)
 /* ---- the print's geometry: which raw rows and columns land where */
 
 #ifdef FOS_CR3
-static int piece_rows(int w) { return PIECE / (w * 3 * 4); }
-static int pieces_for(int w, int h) { return (h + piece_rows(w) - 1) / piece_rows(w); }
+static int piece_rows(int w, int size) { return PIECE / (w * size); }
+static int pieces_for(int w, int h, int size) { return (h + piece_rows(w, size) - 1) / piece_rows(w, size); }
 
 static void free_pieces(struct fos_dev *d)
 {
@@ -756,10 +757,13 @@ static void free_pieces(struct fos_dev *d)
 
 /* the biggest size the camera has the memory for: as many pieces as the largest
  * wants, then the largest they will hold; none if that is only the print's */
-static void take_pieces(struct fos_dev *d)
+static void take_pieces(struct fos_dev *d, int portrait)
 {
-    static const short sizes[][2] = { { DEV_MAX_W, DEV_MAX_H }, { 2240, 1494 }, { 1620, 1080 } };
-    const int want = pieces_for(sizes[0][0], sizes[0][1]);
+    /* a pixel's bytes: at the largest size, landscape, it has one 2 x 2 of the mosaic:
+     * R, G + G and B all fit 16 bits. A portrait frame has more samples to a pixel. */
+    static const short sizes[][3] = { { DEV_MAX_W, DEV_MAX_H, 6 }, { 2240, 1494, 12 }, { 1620, 1080, 12 } };
+    const int first = portrait ? 12 : sizes[0][2];
+    const int want = pieces_for(sizes[0][0], sizes[0][1], first);
     while (d->npieces < want)
     {
         void *p = fos_port_alloc(PIECE);
@@ -769,12 +773,14 @@ static void take_pieces(struct fos_dev *d)
     int got = d->npieces;
     for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]) && !d->banded; i++)
     {
-        int need = pieces_for(sizes[i][0], sizes[i][1]);
+        int size = i ? sizes[i][2] : first;
+        int need = pieces_for(sizes[i][0], sizes[i][1], size);
         if (need > got) continue;
         while (d->npieces > need) fos_port_free(d->pieces[--d->npieces]);
         d->dev_w = sizes[i][0];
         d->dev_h = sizes[i][1];
         d->banded = 1;
+        d->sums16 = size == 6;
     }
     if (!d->banded) free_pieces(d);
     char msg[64];
@@ -815,7 +821,7 @@ static int setup_maps(struct fos_dev *d)
     int portrait = d->orient == 6 || d->orient == 8;
     d->rows_axis_x = portrait;
 #ifdef FOS_CR3
-    if (d->crx && d->jpeg[0]) take_pieces(d);
+    if (d->crx && d->jpeg[0]) take_pieces(d, portrait);
 #endif
     const int W = DEV_W(d), H = DEV_H(d);
     d->oh = H;
@@ -914,10 +920,10 @@ static int setup_maps(struct fos_dev *d)
     if (!d->row_ptr) return fail_mem(d, H * (int) sizeof(uint32_t *));
     if (d->banded)
     {
-        const int rows = piece_rows(W);
+        const int size = d->sums16 ? 6 : 12, rows = piece_rows(W, size);
         for (int i = 0; i < d->npieces; i++) memset(d->pieces[i], 0, PIECE);
         for (int y = 0; y < H; y++)
-            d->row_ptr[y] = (uint32_t *) d->pieces[y / rows] + (y % rows) * W * 3;
+            d->row_ptr[y] = (uint32_t *) ((uint8_t *) d->pieces[y / rows] + (y % rows) * W * size);
     }
     else
     {
@@ -1294,6 +1300,9 @@ static __attribute__((noinline)) void scatter(struct fos_dev *d, const uint16_t 
 }
 
 #ifdef FOS_CR3
+#pragma GCC push_options
+#pragma GCC optimize ("O2")     /* ML builds for size; this and the film's below are whole-number loops */
+
 /* a line of a CR3's plane into the print's sums, as scatter does it */
 static __attribute__((noinline)) void scatter_line(struct fos_dev *d, const struct fos_crx_line *l)
 {
@@ -1310,6 +1319,15 @@ static __attribute__((noinline)) void scatter_line(struct fos_dev *d, const stru
     if (n <= 0 || x >= pic1) return;
     /* RGGB at the sensor's top left, as in scatter */
     const int c = (l->y & 1) + (x & 1);
+    if (d->sums16)
+    {
+        /* a sample to a pixel, in order: columns x, x + 2, ... are pixels k, k + 1, ... */
+        uint16_t *cell = (uint16_t *) d->row_ptr[ro] + c + 3 * d->seg_of[x];
+        int m = (pic1 - x + 1) / 2;
+        if (m > n) m = n;
+        for (const uint16_t *e = v + m; v < e; v++, cell += 3) *cell = (uint16_t) (*cell + *v);
+        return;
+    }
     uint32_t *const *rows = d->row_ptr;
     const int32_t *seg_off = d->seg_off;
     int k = d->seg_of[x];
@@ -1348,12 +1366,13 @@ static int decode_crx(struct fos_dev *d, long n)
         if (r < 0) return fail(d, fos_crx_error(d->crx));
         if (!r) { d->done = d->total; return 0; }
         scatter_line(d, &l);
-        d->crx_x0 = l.tile_x0; d->crx_x1 = l.tile_x1; d->crx_plane = l.plane; d->crx_y = l.y;
+        d->crx_y = l.y;
         d->done += l.n;
         n -= l.n;
     }
     return 0;
 }
+#pragma GCC pop_options
 #endif
 
 /* decode about n samples straight into the print's sums */
@@ -1391,6 +1410,7 @@ FOS_INLINE void pixel_linear(const struct fos_dev *d, int x, int y, int lin[3])
 {
 #ifdef FOS_CR3
     const uint32_t *cell = d->row_ptr[y] + 3 * x;
+    const uint16_t *cell16 = (const uint16_t *) d->row_ptr[y] + 3 * x;
 #else
     int i = y * DEV_W(d) + x;
 #endif
@@ -1404,7 +1424,8 @@ FOS_INLINE void pixel_linear(const struct fos_dev *d, int x, int y, int lin[3])
     {
         /* the mean (sums <= 16383 n, so this fits), less black, balanced */
 #ifdef FOS_CR3
-        int m = n[c] < NMAX ? (int) (cell[c] * recip[n[c]] >> 12) - d->black16 : 0;
+        const uint32_t sum = d->sums16 ? cell16[c] : cell[c];
+        int m = n[c] < NMAX ? (int) (sum * recip[n[c]] >> 12) - d->black16 : 0;
 #else
         int m = n[c] < NMAX ? (int) (d->sums[3 * i + c] * recip[n[c]] >> 12) - d->black16 : 0;
 #endif
@@ -1886,6 +1907,27 @@ static void stage_key(struct fos_dev *d)
 /* Exposing a row goes in two passes, each small enough for the
  * registers: the camera's colours, then linear sRGB. */
 
+#ifdef FOS_CR3
+#pragma GCC push_options
+#pragma GCC optimize ("O2")
+
+/* expose_cam at the largest size: a 2 x 2 of the mosaic to a pixel, so the means are
+ * the R and B samples and half the two greens (recip[1] >> 12 = 16, recip[2] >> 12 = 8) */
+static __attribute__((noinline)) void expose_cam16(const struct fos_dev *d, const uint16_t *sm, uint16_t *cam, int n)
+{
+    const int black = d->black16, p0 = d->pre[0], p1 = d->pre[1], p2 = d->pre[2];
+    for (const uint16_t *e = sm + 3 * n; sm < e; sm += 3, cam += 3)
+    {
+        int m0 = sm[0] * 16 - black, m1 = sm[1] * 8 - black, m2 = sm[2] * 16 - black;
+        int c0 = 0, c1 = 0, c2 = 0;
+        if (m0 > 0) { c0 = (m0 * p0) >> 14; if (c0 > 4096) c0 = 4096; }
+        if (m1 > 0) { c1 = (m1 * p1) >> 14; if (c1 > 4096) c1 = 4096; }
+        if (m2 > 0) { c2 = (m2 * p2) >> 14; if (c2 > 4096) c2 = 4096; }
+        cam[0] = (uint16_t) c0; cam[1] = (uint16_t) c1; cam[2] = (uint16_t) c2;
+    }
+}
+#endif
+
 /* n pixels' sums to camera colour (4096 = white): the means (of counts
  * fixed a, b times along x ra[], rb[]: the even and odd raw rows and
  * columns), less black, balanced */
@@ -1971,7 +2013,8 @@ static __attribute__((noinline)) void stage_expose(struct fos_dev *d, int y0, in
         }
         else { a = d->ne_r[y]; b = d->no_r[y]; ra = d->ne_c; rb = d->no_c; }
 #ifdef FOS_CR3
-        expose_cam(d, d->row_ptr[y] + 3 * xa, d->pos, xb - xa, a, b, ra, rb);
+        if (d->sums16) expose_cam16(d, (const uint16_t *) d->row_ptr[y] + 3 * xa, d->pos, xb - xa);
+        else expose_cam(d, d->row_ptr[y] + 3 * xa, d->pos, xb - xa, a, b, ra, rb);
         uint16_t *out = (uint16_t *) d->row_ptr[y];
         memset(out, 0, 6 * xa);
         memset(out + 3 * xb, 0, 6 * (W - xb));
@@ -2086,6 +2129,10 @@ static __attribute__((noinline)) unsigned finish_grain(uint8_t *o, int n, unsign
     }
     return seed;
 }
+
+#ifdef FOS_CR3
+#pragma GCC pop_options
+#endif
 
 /* row y of the print: vignette, halation, the film's table, grain */
 static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
@@ -2248,6 +2295,7 @@ int fos_dev_step(struct fos_dev *d, int budget_ms)
                     fos_port_close(d->f);
                     d->f = 0;
 #ifdef FOS_CR3
+                    d->read_ms = fos_crx_read_ms(d->crx);
                     fos_crx_close(d->crx); d->crx = 0;
 #endif
                     fos_port_free(d->buf); d->buf = 0;
@@ -2383,9 +2431,9 @@ int fos_dev_step(struct fos_dev *d, int budget_ms)
     d->spent[group] += fos_port_ms() - t0;
     if (r == 1000 && !d->logged)
     {
-        char msg[80];
-        snprintf(msg, sizeof(msg), "dev: %d ms decoding, %d film, %d JPEG, %d print",
-                 d->spent[0], d->spent[1], d->spent[2], d->spent[3]);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "dev: %d ms decoding (%d reading the card), %d film, %d JPEG, %d print",
+                 d->spent[0], d->read_ms, d->spent[1], d->spent[2], d->spent[3]);
         fos_port_log(msg);
         d->logged = 1;
     }
@@ -2473,8 +2521,8 @@ int fos_dev_preview(const struct fos_dev *d, uint8_t *lum, int w, int h)
             raw_of(d, px, py, &rx, &ry);
             int reached = d->done >= d->total || rx < d->sx0 || (rx < d->sx0 + d->sw && ry < d->sy);
 #ifdef FOS_CR3
-            /* a tile's planes come one after the other: green is whole with the second green */
-            if (d->crx) reached = rx < d->crx_x0 || (rx < d->crx_x1 && (d->crx_plane == 3 || (d->crx_plane == 2 && ry < d->crx_y)));
+            /* a row of the mosaic's 2 x 2s at a time, from the top */
+            if (d->crx) reached = ry < (d->crx_y & ~1);
 #endif
             if (!reached) continue;
             /* green, roughly exposed: enough to see the picture come */
@@ -2482,7 +2530,8 @@ int fos_dev_preview(const struct fos_dev *d, uint8_t *lum, int w, int h)
             int n = d->ne_r[xr] * d->no_c[xc] + d->no_r[xr] * d->ne_c[xc];
             if (!n) continue;
 #ifdef FOS_CR3
-            int g = (int) (d->row_ptr[py][3 * px + 1] / n) - PREVIEW_BLACK(d);
+            uint32_t green = d->sums16 ? ((const uint16_t *) d->row_ptr[py])[3 * px + 1] : d->row_ptr[py][3 * px + 1];
+            int g = (int) (green / n) - PREVIEW_BLACK(d);
 #else
             int g = (int) (d->sums[3 * (py * W + px) + 1] / n) - PREVIEW_BLACK(d);
 #endif

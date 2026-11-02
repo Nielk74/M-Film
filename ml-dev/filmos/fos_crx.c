@@ -11,7 +11,11 @@
 #include "fos_crx.h"
 #include <string.h>
 
-#define READ_SIZE   (192 * 1024)
+/* ML builds for size; this is the camera's hottest code, and only whole numbers */
+#pragma GCC optimize ("O2")
+
+#define READ_SIZE   (128 * 1024)        /* each plane's, read ahead from the card */
+#define READ_TOTAL  (2 * 1024 * 1024)   /* in all, with many tiles */
 
 static int be16(const uint8_t *p) { return p[0] << 8 | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t) p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
@@ -175,6 +179,7 @@ struct bits
     uint32_t data;                      /* top aligned */
     int left;                           /* bits in it */
     int failed;
+    int read_ms;
 };
 
 static void bits_start(struct bits *s, int offset, int size)
@@ -192,11 +197,13 @@ static __attribute__((noinline)) int refill(struct bits *s)
 {
     int n = s->file_left < s->cap ? s->file_left : s->cap;
     if (n <= 0) return 0;
+    const int t0 = fos_port_ms();
     if (fos_port_seek(s->f, s->file_pos) < 0 || fos_port_read(s->f, s->buf, n) != n)
     {
         s->failed = 1;
         return 0;
     }
+    s->read_ms += fos_port_ms() - t0;
     s->file_pos += n;
     s->file_left -= n;
     s->pos = 0;
@@ -388,29 +395,101 @@ static int line_top(struct band *b)
         p1++; \
     } while (0)
 
+/* Nearly all the time goes here, a sample at a time: the reader's state stays in
+ * registers (from memory for each bit read, this was far slower) and goes back to
+ * its struct only for the rare slower paths. The buffer is read in fours from its
+ * start, so a word is on a word's boundary. */
+typedef uint32_t __attribute__((may_alias)) aliased_word;
+
+#define BITS_SAVE() (bs->data = data, bs->left = left, bs->pos = (int) (rp - bs->buf))
+#define BITS_LOAD() (data = bs->data, left = bs->left, rp = bs->buf + bs->pos, re = bs->buf + bs->len)
+
+#define GET_BITS(out, n) do { \
+        if (left < (n)) \
+        { \
+            uint32_t w; \
+            if (rp + 4 <= re) { w = __builtin_bswap32(*(const aliased_word *) rp); rp += 4; } \
+            else { BITS_SAVE(); w = word_slow(bs); BITS_LOAD(); } \
+            const int more = (n) - left; \
+            (out) = (data | w >> left) >> (32 - (n)); \
+            data = w << more; \
+            left = 32 - more; \
+        } \
+        else \
+        { \
+            (out) = data >> (32 - (n)); \
+            data <<= (n); \
+            left -= (n); \
+        } \
+    } while (0)
+
+/* get_code, on the registers */
+#define GET_CODE(code) do { \
+        if (data) \
+        { \
+            const int z = __builtin_clz(data); \
+            data <<= z + 1; \
+            left -= z + 1; \
+            (code) = (uint32_t) z; \
+        } \
+        else { BITS_SAVE(); (code) = (uint32_t) zeros_slow(bs); BITS_LOAD(); } \
+        if ((code) >= 41) GET_BITS(code, 21); \
+        else if (k) { uint32_t low_; GET_BITS(low_, k); (code) = low_ | (code) << k; } \
+    } while (0)
+
+/* a sample from the line before and the one to its left, as SYMBOL */
+#define SYMBOL_FAST(predict, ahead) do { \
+        int32_t pred = p0[1]; \
+        if (predict) \
+        { \
+            int32_t delta = p0[1] - p0[0], left_ = p1[0]; \
+            int neg = delta < 0; \
+            int i = ((p0[0] < left_) ^ neg) << 1 | ((left_ < p0[1]) ^ neg); \
+            pred = i < 2 ? left_ + delta : i == 2 ? left_ : p0[1]; \
+        } \
+        uint32_t code; \
+        GET_CODE(code); \
+        p1[1] = pred + code_value(code); \
+        if (ahead) \
+        { \
+            int32_t d = (p0[2] - p0[1]) * 2; \
+            code = (code + (uint32_t) (d < 0 ? -d : d)) >> 1; \
+            p0++; \
+        } \
+        k = next_k(k, (int) code); \
+        p1++; \
+    } while (0)
+
 static int line_next(struct band *b)
 {
     struct bits *bs = b->bs;
     int32_t *p0 = b->l0, *p1 = b->l1;
     int k = b->k;
     int length = b->width;
+    uint32_t data;
+    int left;
+    const uint8_t *rp, *re;
+    BITS_LOAD();
     p1[0] = p0[1];
     for (; length > 1; length--)
     {
         if (p1[0] != p0[1] || p1[0] != p0[2])
-            SYMBOL(1, 1);
+            SYMBOL_FAST(1, 1);
         else
         {
+            BITS_SAVE();
             int n = get_run(b, length);
+            BITS_LOAD();
             if (n < 0) return -1;
             length -= n;
             p0 += n;
             while (n-- > 0) { p1[1] = p1[0]; p1++; }
-            if (length > 0) SYMBOL(0, length > 1);
+            if (length > 0) SYMBOL_FAST(0, length > 1);
         }
     }
-    if (length == 1) SYMBOL(1, 0);
+    if (length == 1) SYMBOL_FAST(1, 0);
     p1[1] = p1[0] + 1;
+    BITS_SAVE();
     b->k = k;
     return 0;
 }
@@ -443,14 +522,22 @@ struct tile
     int offset[4], size[4];             /* each plane's coded lines */
 };
 
+/* Each tile's plane is coded on its own and they lie one after the other in the
+ * file, but they are decoded side by side, a row of all of them at a time. One after
+ * another would sweep the whole frame in memory once for each of them. */
+struct stream
+{
+    struct bits bs;
+    struct band band;
+};
+
 struct fos_crx
 {
     struct fos_cr3 c;
-    struct bits bs;
-    struct band band;
     struct tile *tiles;
-    int ntiles;
-    int t, plane, row;
+    int ntiles, cols, tile_rows;
+    struct stream *streams;
+    int tile_row, row, col, plane;      /* the next line */
     const char *err;
     uint16_t *out;
     int32_t *lines;
@@ -470,6 +557,8 @@ static int parse_headers(struct fos_crx *x, const uint8_t *h, int size)
     int pw = x->c.raw_w / 2, ph = x->c.raw_h / 2, tw = x->c.tile_w / 2, th = x->c.tile_h / 2;
     int cols = (pw + tw - 1) / tw, rows = (ph + th - 1) / th;
     x->ntiles = cols * rows;
+    x->cols = cols;
+    x->tile_rows = rows;
     if (x->ntiles > 64) return 0;
     x->tiles = fos_port_alloc(x->ntiles * (int) sizeof(struct tile));
     if (!x->tiles) return 0;
@@ -519,28 +608,36 @@ struct fos_crx *fos_crx_open(void *f, const struct fos_cr3 *c, const char **why)
     int width = 0;
     for (int i = 0; i < x->ntiles; i++)
         if (x->tiles[i].w > width) width = x->tiles[i].w;
-    x->lines = fos_port_alloc((width + 2) * 2 * (int) sizeof(int32_t));
+    const int nstreams = x->ntiles * c->planes, nlines = (width + 2) * 2;
+    int cap = READ_TOTAL / nstreams;
+    cap = (cap < READ_SIZE ? cap : READ_SIZE) & ~3;     /* whole words: see line_next */
+    x->streams = fos_port_alloc(nstreams * (int) sizeof(struct stream));
+    x->lines = fos_port_alloc(nstreams * nlines * (int) sizeof(int32_t));
     x->out = fos_port_alloc(width * (int) sizeof(uint16_t));
-    x->buf = fos_port_alloc(READ_SIZE);
-    if (!x->lines || !x->out || !x->buf) { fail_open(x, why, "out of memory (CR3 lines)"); return 0; }
-    x->bs.f = f;
-    x->bs.buf = x->buf;
-    x->bs.cap = READ_SIZE;
-    x->band.bs = &x->bs;
-    x->band.lines = x->lines;
+    x->buf = fos_port_alloc(nstreams * cap);
+    if (!x->streams || !x->lines || !x->out || !x->buf) { fail_open(x, why, "out of memory (CR3 lines)"); return 0; }
+    memset(x->streams, 0, nstreams * sizeof(struct stream));
+    for (int i = 0; i < nstreams; i++)
+    {
+        struct stream *st = &x->streams[i];
+        const struct tile *t = &x->tiles[i / c->planes];
+        st->bs.f = f;
+        st->bs.buf = x->buf + i * cap;
+        st->bs.cap = cap;
+        st->band.bs = &st->bs;
+        st->band.lines = x->lines + i * nlines;
+        bits_start(&st->bs, t->offset[i % c->planes], t->size[i % c->planes]);
+        band_start(&st->band, t->w, t->h);
+    }
     return x;
 }
 
 int fos_crx_next(struct fos_crx *x, struct fos_crx_line *line)
 {
-    if (x->t >= x->ntiles) return 0;
-    struct tile *t = &x->tiles[x->t];
-    if (!x->row)
-    {
-        bits_start(&x->bs, t->offset[x->plane], t->size[x->plane]);
-        band_start(&x->band, t->w, t->h);
-    }
-    const int32_t *in = band_line(&x->band);
+    if (x->tile_row >= x->tile_rows) return 0;
+    const int tile = x->tile_row * x->cols + x->col;
+    const struct tile *t = &x->tiles[tile];
+    const int32_t *in = band_line(&x->streams[tile * x->c.planes + x->plane].band);
     if (!in) { x->err = "damaged CR3 data"; return -1; }
     const int bits = x->c.bits, median = 1 << (bits - 1), top = (1 << bits) - 1;
     uint16_t *out = x->out;
@@ -554,19 +651,27 @@ int fos_crx_next(struct fos_crx *x, struct fos_crx_line *line)
     line->n = t->w;
     line->x0 = 2 * t->x0 + (x->plane & 1);
     line->y = 2 * (t->y0 + x->row) + (x->plane >> 1);
-    line->tile_x0 = 2 * t->x0;
-    line->tile_x1 = 2 * (t->x0 + t->w);
-    line->plane = x->plane;
-    if (++x->row == t->h)
+    if (++x->plane == x->c.planes)
     {
-        x->row = 0;
-        if (++x->plane == x->c.planes)
+        x->plane = 0;
+        if (++x->col == x->cols)
         {
-            x->plane = 0;
-            x->t++;
+            x->col = 0;
+            if (++x->row == t->h)
+            {
+                x->row = 0;
+                x->tile_row++;
+            }
         }
     }
     return 1;
+}
+
+int fos_crx_read_ms(const struct fos_crx *x)
+{
+    int ms = 0;
+    for (int i = 0; i < x->ntiles * x->c.planes; i++) ms += x->streams[i].bs.read_ms;
+    return ms;
 }
 
 const char *fos_crx_error(const struct fos_crx *x)
@@ -578,6 +683,7 @@ void fos_crx_close(struct fos_crx *x)
 {
     if (!x) return;
     fos_port_free(x->tiles);
+    fos_port_free(x->streams);
     fos_port_free(x->lines);
     fos_port_free(x->out);
     fos_port_free(x->buf);

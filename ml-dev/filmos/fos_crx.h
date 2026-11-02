@@ -30,15 +30,15 @@ struct fos_crx_line
 {
     const uint16_t *v;
     int n, x0, y;
-    int tile_x0, tile_x1;               /* the columns of the tile it is in */
-    int plane;
 };
 
 struct fos_crx;
 
 struct fos_crx *fos_crx_open(void *f, const struct fos_cr3 *c, const char **why);
-/* 1: a line; 0: the frame is done; < 0: damaged (see fos_crx_error) */
+/* 1: a line, top to bottom, each row's planes together; 0: the frame is done;
+ * < 0: damaged (see fos_crx_error) */
 int fos_crx_next(struct fos_crx *x, struct fos_crx_line *line);
+int fos_crx_read_ms(const struct fos_crx *x);    /* the time spent reading the card */
 const char *fos_crx_error(const struct fos_crx *x);
 void fos_crx_close(struct fos_crx *x);
 

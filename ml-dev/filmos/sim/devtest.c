@@ -146,11 +146,11 @@ int main(int argc, char **argv)
             /* -P n: how much of the latent image is up at progress n */
             enum { PW = 120, PH = 80 };
             static uint8_t lum[PW * PH];
-            int left = 0, right = 0;
+            int top = 0, bottom = 0;
             if (fos_dev_preview(d, lum, PW, PH))
                 for (int i = 0; i < PW * PH; i++)
-                    if (lum[i] != 255) { if (i % PW < PW / 2) left++; else right++; }
-            printf("preview at %d: %d left, %d right, of %d each\n", p, left, right, PW * PH / 2);
+                    if (lum[i] != 255) { if (i < PW * PH / 2) top++; else bottom++; }
+            printf("preview at %d: %d top, %d bottom, of %d each\n", p, top, bottom, PW * PH / 2);
             preview_at = 0;
         }
     }

@@ -163,9 +163,17 @@ prefix, a false "set RAW" notice and an unknown aperture, all now handled for th
 camera. That body refused single blocks of 90 MB and 40 MB (and 1620 x 1080 then took
 42 s, never explained), so a bigger frame now uses 8 MB pieces. In pieces, one frame
 developed there at 3360 x 2240: 80 s in all (34 s decoding, 24 film, 15 JPEG, 2 print)
-and a 1.7 MB JPEG, with all 11 pieces available. A whole roll, memory over many frames
-and a vertical frame are untested there. The JPEG is written in one go, so the screen
-pauses meanwhile. `autoexec.bin` of 359,904 bytes starts; the boot limit is unknown.
+and a 1.7 MB JPEG, with all 11 pieces available. A landscape frame at that size now
+takes 6 pieces, and its planes are decoded row by row. A later frame of nearly the same
+file size, on another film, took 69 s there (28 s decoding, 7.4 of it reading the card,
+22 film, 12 JPEG, 2 print) and a 1.2 MB JPEG; part of the JPEG's gain is that frame's
+smaller file. Those two runs are not the same frame, so the 11 s is approximate. The
+outputs are not approximate: the code before and after this change, on x86 and emulated
+ARM, given the card's film tables and the camera's date and model name, each reproduce
+both frames' JPEG and print from the camera byte for byte. `test_cr3.py` holds every
+output to its exact bytes through speed work. A whole roll, memory over many frames and
+a vertical frame are untested there. The JPEG is written in one go, so the screen
+pauses meanwhile. `autoexec.bin` of 362,784 bytes starts; the boot limit is unknown.
 `CRASH00.LOG` recorded one Canon `ImageController.c:981` assert in that testing, in
 LiveView after M-Film had closed and before any developing. Its cause is unknown.
 `WHITE_LEVEL` comes from LibRaw at ISO 100 (the test body's file gave 14448, not 14008). C-RAW is later work. Do not mark EOS R as supported in the main

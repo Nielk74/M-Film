@@ -94,17 +94,17 @@ class Cr3DecoderTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("C-RAW isn't supported yet", result.stderr)
 
-    def test_latent_image_comes_up_tile_by_tile(self):
-        # Halfway the first tile (the left half of the sensor) has all its
-        # planes in, and nothing of the second has green yet.
+    def test_latent_image_comes_up_from_the_top(self):
+        # Decoding goes row by row, all planes together: 44 % through, the top
+        # half is coming up and nothing of the bottom half has been read.
         cr3 = sample("Canon_EOS_R_RAW_ISO_100.CR3")
-        result = run(SIM / "out/devtest-r", "-P", "450", cr3, self.work / "preview.FOP", cwd=SIM)
+        result = run(SIM / "out/devtest-r", "-P", "350", cr3, self.work / "preview.FOP", cwd=SIM)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        match = re.search(r"preview at \d+: (\d+) left, (\d+) right, of (\d+) each", result.stdout)
+        match = re.search(r"preview at \d+: (\d+) top, (\d+) bottom, of (\d+) each", result.stdout)
         self.assertIsNotNone(match, result.stdout)
-        left, right, each = (int(g) for g in match.groups())
-        self.assertGreater(left, each // 2, result.stdout)  # the brightest parts look like paper
-        self.assertEqual(right, 0, result.stdout)
+        top, bottom, each = (int(g) for g in match.groups())
+        self.assertGreater(top, each // 4, result.stdout)  # the brightest parts look like paper
+        self.assertEqual(bottom, 0, result.stdout)
 
 
 class BigJpegTests(unittest.TestCase):
@@ -181,10 +181,10 @@ class BigJpegTests(unittest.TestCase):
 
     def test_log_says_where_the_time_went(self):
         _, _, result = self.develop(self.cr3, "timing")
-        self.assertRegex(result.stderr, r"dev: \d+ ms decoding, \d+ film, \d+ JPEG, \d+ print")
+        self.assertRegex(result.stderr, r"dev: \d+ ms decoding \(\d+ reading the card\), \d+ film, \d+ JPEG, \d+ print")
 
     def test_it_steps_down_to_the_size_memory_allows(self):
-        for limit, size in ((60000000, (2240, 1494)), (30000000, (1620, 1080))):
+        for limit, size in ((60000000, (3360, 2240)), (45000000, (2240, 1494)), (30000000, (1620, 1080))):
             with self.subTest(limit=limit):
                 jpeg, ppm, result = self.develop(self.cr3, f"step{limit}", env={"FOS_ALLOC_TOTAL": str(limit)})
                 self.assertEqual(Image.open(jpeg).size, size, result.stderr)
@@ -220,12 +220,54 @@ class BigJpegTests(unittest.TestCase):
         self.assertGreater(shown[:, 210:510].mean(), 40)
 
     def test_latent_image_still_comes_up_at_the_bigger_size(self):
-        _, _, result = self.develop(self.cr3, "preview", extra=("-P", "450"))
-        match = re.search(r"preview at \d+: (\d+) left, (\d+) right, of (\d+) each", result.stdout)
+        _, _, result = self.develop(self.cr3, "preview", extra=("-P", "350"))
+        match = re.search(r"preview at \d+: (\d+) top, (\d+) bottom, of (\d+) each", result.stdout)
         self.assertIsNotNone(match, result.stdout)
-        left, right, each = (int(g) for g in match.groups())
-        self.assertGreater(left, each // 2, result.stdout)
-        self.assertEqual(right, 0, result.stdout)
+        top, bottom, each = (int(g) for g in match.groups())
+        self.assertGreater(top, each // 4, result.stdout)
+        self.assertEqual(bottom, 0, result.stdout)
+
+
+class SameOutputTests(unittest.TestCase):
+    """Speed work may not change one byte of what comes out."""
+
+    # sha256 (first 20) of the JPEG and the print, as developed before any speed work.
+    # They came out the same from this PC's build and from emulated ARM.
+    EXPECTED = [
+        ("portra400", {}, False, "f6e4d6c018186ef7b67f", "7030e1245fa37c7393c5"),
+        ("gold200", {}, False, "11fe93c1d274020367e3", "40bebf7bc36140659ca3"),
+        ("cinestill800t", {}, False, "ae3a332999e9ffe3fafc", "af40a97e6b2181dfd0de"),
+        ("portra400", {}, True, "baf2b5ec2ce965cc74d8", "fd7160439334bf2a08c1"),
+        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "f78ff99654be701172c2", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "b262b454a62d0e2a2d67", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "d7b8beab7dcf9156ffbf", None),
+    ]
+
+    def test_every_size_and_film_is_byte_identical(self):
+        result = run("make", "-C", SIM, "-j4", "out/devtest-r")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        good = sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes()
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            (work / "wide.CR3").write_bytes(good)
+            tall = bytearray(good)
+            base = tall.find(b"CMT1") + 4
+            ifd = int.from_bytes(tall[base + 4:base + 8], "little")
+            for i in range(int.from_bytes(tall[base + ifd:base + ifd + 2], "little")):
+                entry = base + ifd + 2 + 12 * i
+                if int.from_bytes(tall[entry:entry + 2], "little") == 0x0112:
+                    tall[entry + 8] = 6
+            (work / "tall.CR3").write_bytes(tall)
+            for film, env, vertical, jpeg_hash, print_hash in self.EXPECTED:
+                with self.subTest(film=film, env=env, vertical=vertical):
+                    source = work / ("tall.CR3" if vertical else "wide.CR3")
+                    done = subprocess.run(
+                        [str(SIM / "out/devtest-r"), "-f", film, "-j", str(work / "o.jpg"), str(source), str(work / "o.FOP")],
+                        cwd=SIM, text=True, capture_output=True, timeout=300, env={**os.environ, **env})
+                    self.assertEqual(done.returncode, 0, done.stderr)
+                    self.assertEqual(sha256(work / "o.jpg")[:20], jpeg_hash)
+                    if print_hash:
+                        self.assertEqual(sha256(work / "o.FOP")[:20], print_hash)
 
 
 class Cr3DamageTests(unittest.TestCase):
@@ -262,7 +304,7 @@ class Cr3DamageTests(unittest.TestCase):
         self.assertEqual(self.develop(self.good, "good.CR3").returncode, 0)
 
     def test_every_size_stays_inside_its_buffers(self):
-        for limit in ("999999999", "60000000", "30000000", "8000000"):
+        for limit in ("999999999", "60000000", "45000000", "30000000", "8000000"):
             with self.subTest(limit=limit, vertical=False):
                 path = self.work / "sizes.CR3"
                 path.write_bytes(self.good)
