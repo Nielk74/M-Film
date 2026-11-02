@@ -33,7 +33,7 @@ out/devtest: $(DEV) ../*.h out/FOSFILMS.BIN
 # the same with the EOS R's sensor colours, for its CR3 files
 out/devtest-r: $(DEV) ../*.h out/FOSFILMS.BIN
 	mkdir -p out
-	$(CC) $(CFLAGS) -DFOS_DEV_TEST -DCONFIG_R -o $@ $(DEV) -lm
+	$(CC) $(CFLAGS) -DFOS_DEV_TEST -DCONFIG_R -pthread -o $@ $(DEV) -lm
 
 # the same, loading words off their boundary the way the camera's ARM does (rotated):
 # a print that differs from out/devtest's has a read the camera gets wrong (lines, #6)

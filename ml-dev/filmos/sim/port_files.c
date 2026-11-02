@@ -9,9 +9,38 @@
 
 void *fos_port_open(const char *path, int write) { return fopen(path, write ? "wb" : "rb"); }
 int  fos_port_read(void *f, void *buf, int size) { return (int) fread(buf, 1, size, f); }
-int  fos_port_write(void *f, const void *buf, int size) { return (int) fwrite(buf, 1, size, f); }
+int  fos_port_writes;
+int  fos_port_write(void *f, const void *buf, int size) { fos_port_writes++; return (int) fwrite(buf, 1, size, f); }
 int  fos_port_seek(void *f, int offset) { return fseek(f, offset, SEEK_SET); }
 void fos_port_close(void *f) { if (f) fclose(f); }
+
+#ifdef CONFIG_R
+#include <pthread.h>
+
+struct other_core { void (*fn)(void *); void *arg; };
+
+static void *other_core_thread(void *p)
+{
+    const struct other_core c = *(struct other_core *) p;
+    free(p);
+    c.fn(c.arg);
+    return 0;
+}
+
+/* FOS_ONE_CORE: as when the task can't be had */
+int fos_port_other_core(void (*fn)(void *), void *arg)
+{
+    if (getenv("FOS_ONE_CORE")) return 0;
+    struct other_core *c = malloc(sizeof(*c));
+    pthread_t t;
+    if (!c) return 0;
+    c->fn = fn;
+    c->arg = arg;
+    if (pthread_create(&t, 0, other_core_thread, c)) { free(c); return 0; }
+    pthread_detach(t);
+    return 1;
+}
+#endif
 
 const char *fos_port_model() { return "Canon EOS M"; }
 

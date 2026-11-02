@@ -240,7 +240,7 @@ class EosRFilmTests(unittest.TestCase):
     """The EOS R's films: the shot's white balance, a quarter of the scanner, their tables, film grain."""
 
     TABLES = {"portra400": "095f0b15e87e8afe", "gold200": "de1be4c0d476c648", "cinestill800t": "2a5ebccccc1addd8"}
-    GRAIN = "2f88be3d34f4444c"
+    GRAIN = "9e762caf5b8d73d9"
 
     @classmethod
     def setUpClass(cls):
@@ -369,6 +369,30 @@ class EosRFilmTests(unittest.TestCase):
         self.assertEqual(len(outputs), 1, "all of these fall back to the same noise")
         self.assertNotIn(film, outputs)
 
+    def test_the_grain_has_no_clumps_to_show_as_holes(self):
+        grain = (ROOT / "ml-dev/films/eos_r/grain.bin").read_bytes()
+        for name, at in (("fine", 0), ("coarse", 2 * 128 * 128 + 256)):
+            tile = [[v - 256 if v > 127 else v for v in grain[at + y * 128:at + (y + 1) * 128]] for y in range(128)]
+            values = [v for row in tile for v in row]
+            mean = sum(values) / len(values)
+            spread = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
+            self.assertAlmostEqual(spread, 32, delta=0.5, msg=f"{name}: its strength stays")
+            # the mean of each 16 x 16 patch, the tile wrapping: white noise would give 2
+            patches = []
+            for y in range(0, 128, 4):
+                for x in range(0, 128, 4):
+                    patches.append(sum(tile[(y + j) & 127][(x + i) & 127] for j in range(16) for i in range(16)) / 256)
+            patch_spread = (sum(v * v for v in patches) / len(patches)) ** 0.5
+            self.assertLess(patch_spread, 2.5, f"{name}: patches this far from the mean look like holes in dark areas")
+
+    def test_the_grain_fades_out_near_black(self):
+        grain = (ROOT / "ml-dev/films/eos_r/grain.bin").read_bytes()
+        for name, at in (("fine", 2 * 128 * 128), ("coarse", 2 * 128 * 128 + 256 + 2 * 128 * 128)):
+            tone = grain[at:at + 256]
+            self.assertEqual(tone[0], 0, name)
+            self.assertLess(tone[12], 25, f"{name}: real film goes quiet in its blacks")
+            self.assertEqual(tone[128], 128, f"{name}: mid grey keeps its strength")
+
     def test_mixing_without_the_table_never_takes_its_place(self):
         empty = self.work / "empty"
         empty.mkdir()
@@ -377,20 +401,130 @@ class EosRFilmTests(unittest.TestCase):
         self.assertFalse((empty / "LOOK00.LUT").exists())
 
 
+class ShadowColourTests(unittest.TestCase):
+    """Real film's shadows hold little colour noise. The JPEG's chroma calms it there, and only there."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.work = Path(cls.tmp.name)
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.binary = cls.work / "jpegtest"
+        result = run("gcc", "-std=gnu99", "-O2", "-DCONFIG_R", "jpegtest.c", "port_files.c", "../fos_jpeg.c",
+                     "-lm", "-pthread", "-o", cls.binary, cwd=SIM)
+        if result.returncode:
+            raise RuntimeError(result.stderr)
+
+    def picture(self, width, height):
+        """Left half dark, right half bright, both with the same colour noise; a red square in the dark."""
+        rng = numpy.random.default_rng(8736)
+        cells = lambda sd: numpy.kron(rng.normal(0, sd, (height // 2, width // 2)), numpy.ones((2, 2)))
+        y = numpy.full((height, width), 26.0)
+        y[:, width // 2:] = 150
+        y += rng.normal(0, 3, (height, width))
+        cb, cr = cells(6), cells(6)
+        rgb = numpy.stack((y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb), axis=2)
+        rgb[304:496, 304:496] = (255, 30, 30)       # on the 16 x 16 grid, so no block rings past it
+        return numpy.clip(numpy.round(rgb), 0, 255).astype(numpy.uint8)
+
+    def write(self, width, height):
+        raw, out = self.work / "in.rgb", self.work / "out.jpg"
+        raw.write_bytes(self.picture(width, height).tobytes())
+        done = run(self.binary, raw, width, height, out, cwd=SIM)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        writes = int(done.stdout.split()[1])
+        return numpy.asarray(Image.open(out).convert("YCbCr")).astype(float), writes, out.stat().st_size
+
+    def test_shadows_lose_colour_noise_and_bright_areas_keep_it(self):
+        a, _, _ = self.write(2400, 1600)
+        dark, bright = a[900:1300, 800:1100], a[900:1300, 1500:1900]
+        for channel, name in ((1, "Cb"), (2, "Cr")):
+            self.assertLess(dark[:, :, channel].std(), bright[:, :, channel].std() / 2, name)
+            self.assertGreater(bright[:, :, channel].std(), 4, name)
+        self.assertGreater(dark[:, :, 0].std(), 2, "the brightness noise is the grain's: it stays")
+
+    def test_a_bright_colour_does_not_bleed_into_the_black_beside_it(self):
+        a, _, _ = self.write(2400, 1600)
+        beside = a[340:460, 498:501, 2].mean()
+        far = a[900:1300, 800:1100, 2].mean()
+        self.assertLess(abs(beside - far), 3)
+
+    def test_small_frames_have_averaged_it_already(self):
+        a, _, _ = self.write(1200, 800)
+        dark, bright = a[500:700, 400:560], a[500:700, 700:1100]
+        self.assertGreater(dark[:, :, 2].std(), bright[:, :, 2].std() * 0.8)
+
+    def test_the_file_goes_to_the_card_in_big_pieces(self):
+        _, writes, size = self.write(2400, 1600)
+        self.assertLessEqual(writes, size // 32768 + 2, "the camera flushes its caches for every write")
+
+
 class SameOutputTests(unittest.TestCase):
     """Speed work may not change one byte of what comes out."""
 
     # sha256 (first 20) of the JPEG and the print, with the card's tables. They came out the same
     # from this PC's build and from emulated ARM.
     EXPECTED = [
-        ("portra400", {}, False, "e95dde42a8fd9970d187", "879779158f1c98f1c95e"),
-        ("gold200", {}, False, "12f4960c82920c907f5b", "435c328f26cdb3bdc471"),
-        ("cinestill800t", {}, False, "bdcb72bcbc3c3299dc48", "d01b781c7e921d4e3f13"),
-        ("portra400", {}, True, "35b2b11abf87e7c6cc49", "e1722b837de9f3163418"),
-        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "f2e5b7f089fd1e979c25", None),
-        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "074b12159e5840622c37", None),
-        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "dbbb44492029a3721ee0", None),
+        ("portra400", {}, False, "d61e76bf8fa6efad7295", "61bcd042f70a0b9144f1"),
+        ("gold200", {}, False, "8152e58f7cffc592226a", "92a673fc94f7d3aaa53d"),
+        ("cinestill800t", {}, False, "a5459aa813b8b3141a63", "e23cddfc760344b5a60a"),
+        ("portra400", {}, True, "0f2106c9ea45a2f520f2", "f5b62ba9c524ed496f9c"),
+        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "2c644f577ddd08fb62a9", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "0de2beea5152d537cb26", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "7cee9f1c365e1bd03e6a", None),
     ]
+
+    def develop_on(self, binary, work, env):
+        done = subprocess.run(
+            [str(binary), "-f", "portra400", "-j", str(work / "o.jpg"), str(work / "wide.CR3"), str(work / "o.FOP")],
+            cwd=SIM, text=True, capture_output=True, timeout=590,
+            env={**os.environ, "FOS_LUT_DIR": str(work / "tables"), **env})
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        return done.stderr, sha256(work / "o.jpg")[:20], sha256(work / "o.FOP")[:20]
+
+    def test_the_second_core_takes_work_and_changes_no_byte(self):
+        result = run("make", "-C", SIM, "-j4", "out/devtest-r")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            install_tables(work / "tables")
+            (work / "wide.CR3").write_bytes(sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes())
+            log, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {})
+            self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
+            self.assertRegex(log, r"other core: [1-9]\d* of \d+ rows of film")
+            self.assertRegex(log, r"other core: [1-9]\d* of \d+ rows of the JPEG")
+            alone, jpeg, print_ = self.develop_on(SIM / "out/devtest-r", work, {"FOS_ONE_CORE": "1"})
+            self.assertEqual((jpeg, print_), self.EXPECTED[0][3:5])
+            self.assertRegex(alone, r"other core: 0 of \d+ rows of film")
+            self.assertRegex(alone, r"other core: 0 of \d+ rows of the JPEG")
+
+    def test_the_two_cores_share_nothing_unguarded(self):
+        sources = ["devtest.c", "port_files.c", "films.c"] + [
+            f"../{n}.c" for n in ("fos_dev", "fos_crx", "fos_print", "fos_looks", "fos_film", "fos_gfx", "fos_jpeg")]
+        version = (ROOT / "VERSION").read_text().strip()
+        with tempfile.TemporaryDirectory() as work:
+            work = Path(work)
+            binary = work / "devtest-tsan"
+            result = run("gcc", "-std=gnu99", "-O1", "-g", "-fsanitize=thread", "-no-pie", "-DFOS_DEV_TEST", "-DCONFIG_R",
+                         f'-DMFILM_VERSION="{version}"', *sources, "-lm", "-pthread", "-o", binary, cwd=SIM)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            install_tables(work / "tables")
+            (work / "wide.CR3").write_bytes(sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes())
+            # Whether it can start at all depends on where this run's memory fell: it says so at once
+            for _ in range(200):
+                done = subprocess.run(
+                    [str(binary), "-f", "portra400", "-j", str(work / "o.jpg"), str(work / "wide.CR3"), str(work / "o.FOP")],
+                    cwd=SIM, text=True, capture_output=True, timeout=590,
+                    env={**os.environ, "FOS_LUT_DIR": str(work / "tables"), "TSAN_OPTIONS": "halt_on_error=1 exitcode=66"})
+                if "unexpected memory mapping" not in done.stderr:
+                    break
+            else:
+                self.skipTest("ThreadSanitizer can't map its memory on this kernel")
+            self.assertEqual(done.returncode, 0, done.stderr[:3000])
+            self.assertNotIn("ThreadSanitizer", done.stderr)
+            self.assertRegex(done.stderr, r"other core: [1-9]\d* of \d+ rows of film")
+            self.assertEqual(sha256(work / "o.jpg")[:20], self.EXPECTED[0][3])
+            self.assertEqual(sha256(work / "o.FOP")[:20], self.EXPECTED[0][4])
 
     def test_every_size_and_film_is_byte_identical(self):
         result = run("make", "-C", SIM, "-j4", "out/devtest-r")
@@ -437,7 +571,7 @@ class Cr3DamageTests(unittest.TestCase):
             f"../{n}.c" for n in ("fos_dev", "fos_crx", "fos_print", "fos_looks", "fos_film", "fos_gfx", "fos_jpeg")]
         version = (ROOT / "VERSION").read_text().strip()
         result = run("gcc", "-std=gnu99", "-O1", "-g", "-fsanitize=address", "-fno-omit-frame-pointer",
-                     "-DFOS_DEV_TEST", "-DCONFIG_R", f'-DMFILM_VERSION="{version}"', *sources, "-lm",
+                     "-DFOS_DEV_TEST", "-DCONFIG_R", f'-DMFILM_VERSION="{version}"', *sources, "-lm", "-pthread",
                      "-o", cls.work / "devtest-asan", cwd=SIM)
         if result.returncode:
             raise RuntimeError(result.stderr)

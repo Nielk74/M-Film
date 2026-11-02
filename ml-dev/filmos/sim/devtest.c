@@ -35,6 +35,7 @@ void *fos_port_alloc(int size)
     return malloc(size);
 }
 int fos_port_dev_cap() { return 0; }
+void fos_port_sleep(int ms) {}
 void fos_port_log(const char *msg) { fprintf(stderr, "%s\n", msg); }
 void fos_port_free(void *p) { free(p); }
 

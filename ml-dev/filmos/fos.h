@@ -177,6 +177,11 @@ const char *fos_port_model();               /* "Canon EOS M": the camera it runs
  * fos_port_palette() goes back to the film OS's own */
 void fos_port_photo(const uint8_t (*pal)[3], int n, int k);
 void fos_port_log(const char *msg);         /* the debug log, if it is on */
+#ifdef CONFIG_R
+/* fn(arg) on the camera's other core, 1 if it was started. fn may touch only memory: no files,
+ * no clock, no log, and not the screen. */
+int  fos_port_other_core(void (*fn)(void *), void *arg);
+#endif
 /* developing works in slices until a time budget is spent; the simulator's
  * clock stands still meanwhile, so it caps the slices instead (0: no cap) */
 int  fos_port_dev_cap();

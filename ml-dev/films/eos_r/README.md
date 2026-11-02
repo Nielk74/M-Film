@@ -30,6 +30,9 @@ Picture Style they were shot with isn't known.
 
 `grain.bin` is grmod-film's film grain (`core/src/color/grain-tables.ts`, made by its `tools/grain/tiles.py`
 from the Boolean film grain model): for fine, then coarse, a 128 x 128 luma tile, 128 rows of 64 (Cb, Cr) pairs,
-and the strength by brightness in 256 bytes, most in the shadows and lower midtones.
+and the strength by brightness in 256 bytes, most in the shadows and lower midtones. `soften_grain.py` then took
+out what is coarser than about 10 pixels, keeping the strength: those clumps showed as dark holes in the noise of
+black areas. It also fades the grain out below brightness 30, as scans of 800T go quiet in their blacks. Its input,
+the tiles as they came, is `grain.bin` at commit 84aba9b.
 
 Every number is set by hand or fitted to those frames: these are interpretations, not measurements of the films.

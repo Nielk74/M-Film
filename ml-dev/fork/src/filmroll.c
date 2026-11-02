@@ -889,6 +889,17 @@ int fos_port_read(void *f, void *buf, int size)
     return done;
 }
 
+#ifdef CONFIG_R
+/* task_create_ex: on this firmware task_create + 0x224, where it also is on the M50. Below Canon's
+ * tasks: the second core is theirs when they want it, and otherwise idle. */
+#define OTHER_CORE_TASK ((uint32_t (*)(const char *, uint32_t, uint32_t, void *, void *, int)) 0xE051751F)
+
+int fos_port_other_core(void (*fn)(void *), void *arg)
+{
+    return !(OTHER_CORE_TASK("film_core1", 0x1e, 0x4000, fn, arg, 1) & 1);      /* an error is odd, a task's id even */
+}
+#endif
+
 int fos_port_write(void *f, const void *buf, int size)
 {
     return FIO_WriteFile(f, buf, size);

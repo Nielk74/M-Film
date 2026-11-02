@@ -452,6 +452,11 @@ struct fos_dev
     uint8_t gx[DEV_MAX_W], fx[DEV_MAX_W];   /* glow cell and weight (1/8) per column */
     unsigned seed;
     uint16_t pos[3 * DEV_MAX_W];        /* a row's positions on the film's grid */
+#ifdef FOS_CR3
+    uint16_t pos1[3 * DEV_MAX_W];       /* the same, on the other core */
+    int chunk, other_busy, other_stop;  /* see film_chunk: atomics */
+    int other_asked, other_rows;
+#endif
 
     /* palette */
     uint32_t *hist;
@@ -1809,6 +1814,10 @@ void fos_dev_jpeg(struct fos_dev *d, const char *path)
 void fos_dev_free(struct fos_dev *d)
 {
     if (!d) return;
+#ifdef FOS_CR3
+    __atomic_store_n(&d->other_stop, 1, __ATOMIC_RELEASE);
+    while (__atomic_load_n(&d->other_busy, __ATOMIC_ACQUIRE)) fos_port_sleep(1);
+#endif
     if (d->f) fos_port_close(d->f);
 #ifdef FOS_CR3
     fos_crx_close(d->crx);
@@ -2027,10 +2036,16 @@ static __attribute__((noinline)) void expose_lin(const struct fos_dev *d, const 
  * read before it is written, and its values only ever overwrite sums
  * already read); the highlights go into the halation grid on the way. The
  * same sums as pixel_linear, walked along the row. */
+#ifdef FOS_CR3
+static __attribute__((noinline)) void stage_expose(struct fos_dev *d, int y0, int y1, uint16_t *pos)
+{
+    const int W = DEV_W(d);
+#else
 static __attribute__((noinline)) void stage_expose(struct fos_dev *d, int y0, int y1)
 {
     const int W = DEV_W(d);
     uint16_t *lin = (uint16_t *) d->sums;
+#endif
     for (int y = y0; y < y1; y++)
     {
 #ifdef FOS_CR3
@@ -2050,12 +2065,12 @@ static __attribute__((noinline)) void stage_expose(struct fos_dev *d, int y0, in
         }
         else { a = d->ne_r[y]; b = d->no_r[y]; ra = d->ne_c; rb = d->no_c; }
 #ifdef FOS_CR3
-        if (d->sums16) expose_cam16(d, (const uint16_t *) d->row_ptr[y] + 3 * xa, d->pos, xb - xa);
-        else expose_cam(d, d->row_ptr[y] + 3 * xa, d->pos, xb - xa, a, b, ra, rb);
+        if (d->sums16) expose_cam16(d, (const uint16_t *) d->row_ptr[y] + 3 * xa, pos, xb - xa);
+        else expose_cam(d, d->row_ptr[y] + 3 * xa, pos, xb - xa, a, b, ra, rb);
         uint16_t *out = (uint16_t *) d->row_ptr[y];
         memset(out, 0, 6 * xa);
         memset(out + 3 * xb, 0, 6 * (W - xb));
-        expose_lin(d, d->pos, out + 3 * xa, xb - xa, g, xa);
+        expose_lin(d, pos, out + 3 * xa, xb - xa, g, xa);
 #else
         expose_cam(d, d->sums + 3 * (y * W + xa), d->pos, xb - xa, a, b, ra, rb);
         memset(lin + 3 * y * W, 0, 6 * xa);
@@ -2063,7 +2078,9 @@ static __attribute__((noinline)) void stage_expose(struct fos_dev *d, int y0, in
         expose_lin(d, d->pos, lin + 3 * (y * W + xa), xb - xa, g, xa);
 #endif
     }
+#ifndef FOS_CR3
     d->lin = lin;
+#endif
 }
 
 /* halation: the highlights' glow, spread about as the lab's gaussian
@@ -2236,6 +2253,28 @@ static uint8_t *load_film_grain()
 }
 #endif
 
+#ifdef FOS_CR3
+/* what every row of the finish needs, before either core starts on them */
+static void finish_start(struct fos_dev *d)
+{
+    const int W = DEV_W(d), H = DEV_H(d);
+    int pw = d->rows_axis_x ? d->ow : W;
+    /* vignette, as the lab: 1 - 0.12 r^2, r^2 = (x^2 + y^2) / 2 over
+     * -1..1; the x and y parts, in 1/4096 */
+    for (int x = 0; x < pw; x++) { float t = 2.0f * x / (pw - 1) - 1; d->vig_x[x] = (int16_t) (0.06f * t * t * 4096); }
+    for (int k = 0; k < H; k++) { float t = 2.0f * k / (H - 1) - 1; d->vig_y[k] = (int16_t) (0.06f * t * t * 4096); }
+    for (int x = 0; x < W; x++) glow_pos(TO_PRINT(d, x), GW, &d->gx[x], &d->fx[x]);
+    if (!d->film_grain && !(d->film_grain = load_film_grain()))
+        fos_port_log("dev: GRAIN.BIN isn't on the card: copy ML/DARKROOM from the build");
+}
+
+/* row y of the print: vignette, halation, the film's table, grain */
+static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y, uint16_t *pos)
+{
+    const int W = DEV_W(d), H = DEV_H(d);
+    const struct fos_look *L = d->look;
+    int pw = d->rows_axis_x ? d->ow : W, px0 = d->rows_axis_x ? d->ox0 : 0;
+#else
 /* row y of the print: vignette, halation, the film's table, grain */
 static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
 {
@@ -2249,11 +2288,8 @@ static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
         for (int x = 0; x < pw; x++) { float t = 2.0f * x / (pw - 1) - 1; d->vig_x[x] = (int16_t) (0.06f * t * t * 4096); }
         for (int k = 0; k < H; k++) { float t = 2.0f * k / (H - 1) - 1; d->vig_y[k] = (int16_t) (0.06f * t * t * 4096); }
         for (int x = 0; x < W; x++) glow_pos(TO_PRINT(d, x), GW, &d->gx[x], &d->fx[x]);
-#ifdef FOS_CR3
-        if (!d->film_grain && !(d->film_grain = load_film_grain()))
-            fos_port_log("dev: GRAIN.BIN isn't on the card: copy ML/DARKROOM from the build");
-#endif
     }
+#endif
     int hal[3];
 #ifdef FOS_CR3
     /* a table over Canon's tone lifts little light a long way: a strong glow would flare */
@@ -2278,18 +2314,19 @@ static __attribute__((noinline)) void stage_finish(struct fos_dev *d, int y)
 #ifdef FOS_CR3
     /* the row is read before anything is written: in pieces, it goes over itself */
     uint8_t *o = d->banded ? (uint8_t *) d->row_ptr[y] : d->rgb + 3 * y * W;
-    finish_pos((const uint16_t *) d->row_ptr[y] + 3 * px0, d->pos, pw, 4096 - d->vig_y[y], d->vig_x,
+    finish_pos((const uint16_t *) d->row_ptr[y] + 3 * px0, pos, pw, 4096 - d->vig_y[y], d->vig_x,
                d->glow ? grow : 0, d->gx + px0, d->fx + px0, hal);
     memset(o, 0, 3 * px0);
     memset(o + 3 * (px0 + pw), 0, 3 * (W - px0 - pw));
+    finish_lut(pos, o + 3 * px0, pw);
 #else
     uint8_t *o = d->rgb + 3 * y * W;
     memset(o, 0, 3 * px0);
     memset(o + 3 * (px0 + pw), 0, 3 * (W - px0 - pw));
     finish_pos(d->lin + 3 * (y * W + px0), d->pos, pw, 4096 - d->vig_y[y], d->vig_x,
                d->glow ? grow : 0, d->gx + px0, d->fx + px0, hal);
-#endif
     finish_lut(d->pos, o + 3 * px0, pw);
+#endif
     int grain = (int) (L->grain * 255 * 0.55f * 256);
 #ifdef FOS_CR3
     if (W > FOS_PRINT_W) grain = W >= 2240 ? grain * 2 : grain * 3 / 2;     /* less softened by the downscale */
@@ -2357,6 +2394,63 @@ static void make_thumb(struct fos_dev *d)
 }
 
 #ifdef FOS_CR3
+/* The film's rows don't need each other, and with the screen off the second core has nothing else
+ * to do: the two take a chunk at a time until none are left. A chunk is the rows of one row of the
+ * halation's grid, so neither ever adds to a cell the other is adding to. */
+static int film_rows(struct fos_dev *d, int chunk, uint16_t *pos)
+{
+    const int H = DEV_H(d), s = GH * 65536 / H;
+    const int y0 = (chunk * 65536 + s - 1) / s;
+    int y1 = ((chunk + 1) * 65536 + s - 1) / s;
+    if (y1 > H) y1 = H;
+    if (d->stage == ST_EXPOSE) stage_expose(d, y0, y1, pos);
+    else for (int y = y0; y < y1; y++) stage_finish(d, y, pos);
+    return y1;
+}
+
+static void film_other_core(void *arg)
+{
+    struct fos_dev *d = arg;
+    while (!__atomic_load_n(&d->other_stop, __ATOMIC_ACQUIRE))
+    {
+        const int chunk = __atomic_fetch_add(&d->chunk, 1, __ATOMIC_RELAXED);
+        if (chunk >= GH) break;
+        const int s = GH * 65536 / DEV_H(d);
+        d->other_rows += film_rows(d, chunk, d->pos1) - (chunk * 65536 + s - 1) / s;
+    }
+    __atomic_store_n(&d->other_busy, 0, __ATOMIC_RELEASE);
+}
+
+/* a chunk of this stage's rows; 1 when all of them are done, on both cores */
+static int film_chunk(struct fos_dev *d)
+{
+    if (!d->other_asked)
+    {
+        d->other_asked = 1;
+        if (d->stage == ST_FINISH) finish_start(d);
+        __atomic_store_n(&d->chunk, 0, __ATOMIC_RELAXED);
+        /* (the old grain, without GRAIN.BIN, goes from each row into the next) */
+        if (d->stage == ST_EXPOSE || d->film_grain)
+        {
+            __atomic_store_n(&d->other_busy, 1, __ATOMIC_RELEASE);
+            if (!fos_port_other_core(film_other_core, d)) __atomic_store_n(&d->other_busy, 0, __ATOMIC_RELEASE);
+        }
+    }
+    const int chunk = __atomic_fetch_add(&d->chunk, 1, __ATOMIC_RELAXED);
+    if (chunk < GH)
+    {
+        d->row = film_rows(d, chunk, d->pos);
+        return 0;
+    }
+    if (__atomic_load_n(&d->other_busy, __ATOMIC_ACQUIRE))
+    {
+        fos_port_sleep(1);
+        return 0;
+    }
+    d->other_asked = 0;
+    return 1;
+}
+
 static int dev_step(struct fos_dev *d, int budget_ms)
 #else
 int fos_dev_step(struct fos_dev *d, int budget_ms)
@@ -2447,12 +2541,12 @@ int fos_dev_step(struct fos_dev *d, int budget_ms)
                 break;
             case ST_EXPOSE:
 #ifdef FOS_CR3
-                stage_expose(d, d->row, d->row + 8 < H ? d->row + 8 : H);   /* not every size is 8 rows at a time */
+                if (film_chunk(d)) d->stage = d->glow ? ST_GLOW : ST_FINISH, d->row = 0;
 #else
                 stage_expose(d, d->row, d->row + 8);
-#endif
                 d->row += 8;
                 if (d->row >= H) d->stage = d->glow ? ST_GLOW : ST_FINISH, d->row = 0;
+#endif
                 break;
             case ST_GLOW:
                 stage_glow(d);
@@ -2460,10 +2554,19 @@ int fos_dev_step(struct fos_dev *d, int budget_ms)
                 d->row = 0;
                 break;
             case ST_FINISH:
+#ifdef FOS_CR3
+                if (film_chunk(d))
+#else
                 stage_finish(d, d->row);
                 if (++d->row == H)
+#endif
                 {
 #ifdef FOS_CR3
+                    {
+                        char msg[64];
+                        snprintf(msg, sizeof(msg), "dev: other core: %d of %d rows of film", d->other_rows, 2 * H);
+                        fos_port_log(msg);
+                    }
                     if (W == FOS_PRINT_W)       /* else from the print, when it is shrunk */
 #endif
                     make_thumb(d);
