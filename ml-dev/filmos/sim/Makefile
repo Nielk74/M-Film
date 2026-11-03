@@ -24,6 +24,11 @@ out/FOSFILMS.BIN: ../tools/genfilms.py ../tools/catalog.py ../../films/films.py 
 clean:
 	rm -rf out
 
+# the same with what the EOS R has: CR3s and its second core
+out/sim-r: $(SRC) ../fos_crx.c ../*.h out/FOSFONT.BIN out/FOSFILMS.BIN
+	mkdir -p out
+	$(CC) $(CFLAGS) -DCONFIG_R -pthread -o $@ $(SRC) ../fos_crx.c -lm
+
 # developing film: ./out/devtest [-f film] [-r raw.u16] in.CR2 out.FOP out.ppm
 DEV = devtest.c port_files.c films.c ../fos_dev.c ../fos_crx.c ../fos_print.c ../fos_looks.c ../fos_film.c ../fos_gfx.c ../fos_jpeg.c
 out/devtest: $(DEV) ../*.h out/FOSFILMS.BIN

@@ -739,6 +739,12 @@ int develop_update(int dt)
              * screen moves but the dial's hand */
             int calm = (tray == TRAY_LATENT || tray == TRAY_EMPTY) && dry_t >= SLIDE_MS + 100
                        && stop_sheet.x < 0.002f;
+#ifdef CONFIG_R
+            const int dark = fos_port_screen_dark();
+            if (dark) calm = 1;
+#else
+            const int dark = 0;
+#endif
             int p = fos_dev_step(dev, calm ? CALM_MS : STEP_MS);
             if (p >= 0 && p < 1000 && !ghost_final && fos_dev_doing(dev) == FOS_DEV_FIXING)
             {
@@ -746,7 +752,7 @@ int develop_update(int dt)
                 ghost_final = 1;
                 if (fos_dev_preview(dev, ghost, GHOST_W, GHOST_H) && (tray == TRAY_LATENT || tray == TRAY_IN)) tray_dirty = 1;
             }
-            else if (p >= 0 && p < 1000 && ghost_t > 600 && fos_dev_preview(dev, ghost, GHOST_W, GHOST_H))
+            else if (p >= 0 && p < 1000 && !dark && ghost_t > 600 && fos_dev_preview(dev, ghost, GHOST_W, GHOST_H))
             {
                 /* the latent image so far; the paper shows it when it is in the bath */
                 ghost_t = 0;

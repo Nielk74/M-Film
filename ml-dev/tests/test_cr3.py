@@ -601,6 +601,66 @@ class SameOutputTests(unittest.TestCase):
                         self.assertEqual(sha256(work / "o.FOP")[:20], print_hash)
 
 
+class DisplayOffTests(unittest.TestCase):
+    """With Canon's display off while developing, the darkroom draws nothing and takes no time from the frame."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.work = Path(cls.tmp.name)
+        cls.addClassCleanup(cls.tmp.cleanup)
+        result = run("make", "-C", SIM, "-j4", "out/sim-r")
+        if result.returncode:
+            raise RuntimeError(result.stdout + result.stderr)
+        cls.good = sample("Canon_EOS_R_RAW_ISO_100.CR3").read_bytes()
+
+    def develop(self, name, script, dark=None):
+        """A card with a roll of two frames, developed in the simulator: its log, the JPEGs and prints."""
+        card = self.work / name
+        folder = card / "DCIM/100EOS_R"
+        folder.mkdir(parents=True)
+        install_tables_at = card / "ML"
+        install_tables_at.mkdir()
+        install_tables(install_tables_at / "DARKROOM")
+        for frame in (1, 2):
+            (folder / f"IMG_000{frame}.CR3").write_bytes(self.good)
+        (folder / "ROLL_001.TXT").write_text(
+            "roll = 001\nfilm = portra400\nexposures = 36\nloaded = 2026-11-02 01:28:29\n\n"
+            "1  IMG_0001.CR3  2026-11-02 01:29:13  f/2.8\n2  IMG_0002.CR3  2026-11-02 01:29:20  f/2.8\n", encoding="ascii")
+        scene = self.work / (name + ".txt")
+        scene.write_text("open darkroom\n" + script, encoding="ascii")
+        env = {**os.environ, "FOS_CARD": str(card) + "/"}
+        if dark:
+            env["FOS_DARK"] = dark
+        done = subprocess.run([str(SIM / "out/sim-r"), str(scene), "-"], cwd=SIM, text=True, capture_output=True,
+                              timeout=300, env=env)
+        self.assertEqual(done.returncode, 0, done.stderr[-2000:])
+        self.assertIn("busy: developing", done.stderr)
+        outputs = {path.relative_to(card).as_posix(): sha256(path)
+                   for path in card.rglob("*") if path.suffix in (".JPG", ".BMP") and path.parent != card / "ML/DARKROOM"}
+        return done.stderr, outputs
+
+    SCRIPT = "300 set\n800 info\n50000000 end\n"     # it ends itself, when the roll is developed
+
+    def test_nothing_is_drawn_and_the_frames_come_out_the_same(self):
+        lit, lit_out = self.develop("lit", self.SCRIPT)
+        self.assertEqual(len(lit_out), 5, "two JPEGs, two prints and the sheet: " + lit[-1000:])
+        dark, dark_out = self.develop("dark", self.SCRIPT, dark="0-999999999")
+        self.assertRegex(dark, r"dark: 0 presents")
+        self.assertEqual(dark_out, lit_out)
+
+    def test_the_whole_screen_comes_back_with_the_display(self):
+        log, outputs = self.develop("back", self.SCRIPT, dark="1500-2500")
+        self.assertEqual(len(outputs), 5)
+        self.assertRegex(log, r"dark: 0 presents; after it: 1, 1 of the whole screen")
+
+    def test_leaving_still_works_while_it_is_dark(self):
+        log, outputs = self.develop("leave", "300 set\n800 info\n1500 home\n50000000 end\n", dark="1000-999999999")
+        self.assertRegex(log, r"dark: \d+ presents")
+        self.assertLess(int(re.search(r"(\d+) frames, (\d+) ms", log).group(2)), 50000000, "it never left")
+        self.assertEqual(outputs, {}, "it left before a frame was done")
+
+
 class Cr3DamageTests(unittest.TestCase):
     """The camera must report a damaged file, never run off its buffers."""
 

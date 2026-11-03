@@ -743,6 +743,14 @@ int fos_port_key()
     return k;
 }
 
+#ifdef CONFIG_R
+/* 129 is the GUI mode seen as Canon's power saving turns the display off */
+int fos_port_screen_dark()
+{
+    return dev_busy && (!DISPLAY_IS_ON || CURRENT_GUI_MODE == 129);
+}
+#endif
+
 int fos_port_abort()
 {
     if (ui_abort || ml_shutdown_requested || get_halfshutter_pressed())
@@ -751,8 +759,8 @@ int fos_port_abort()
 #ifdef CONFIG_R
     /* Canon's power saving turns the display off about 3 minutes in, and on this body it can't
      * be held off (powersave_prohibit is a property write the whitelist refuses): developing
-     * goes on with the screen dark. 129 is the GUI mode seen as that happens. */
-    if (dev_busy && (!DISPLAY_IS_ON || CURRENT_GUI_MODE == 129))
+     * goes on with the screen dark. */
+    if (fos_port_screen_dark())
     {
         static int told = 0;
         if (!told) dbg("film os: display off (GUI mode %d): developing goes on", CURRENT_GUI_MODE);

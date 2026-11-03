@@ -90,8 +90,30 @@ int fos_port_abort()
     return now_ms > end_t;
 }
 
+#ifdef CONFIG_R
+/* FOS_DARK=a-b: Canon has the display off from a ms to b ms, as long as something is developing */
+static int developing, was_dark, presents_dark, presents_after, whole_after;
+
+int fos_port_screen_dark()
+{
+    const char *dark = getenv("FOS_DARK");
+    if (!developing || !dark || now_ms < atoi(dark) || now_ms >= atoi(strchr(dark, '-') + 1)) return 0;
+    was_dark = 1;
+    return 1;
+}
+#endif
+
 void fos_port_present(const uint8_t *rows, int pitch, int y0, int y1)
 {
+#ifdef CONFIG_R
+    if (fos_port_screen_dark()) presents_dark++;
+    else if (was_dark)
+    {
+        was_dark = 0;
+        presents_after++;
+        if (y0 == 0 && y1 == FOS_H) whole_after++;
+    }
+#endif
     for (int y = y0; y < y1; y++)
         memcpy(&screen[y * FOS_W], &rows[(y - y0) * pitch], FOS_W);
     frame_dirty = 1;
@@ -153,6 +175,10 @@ void fos_port_action(int a, int x, int y)
     }
     if (a == FA_REWIND) roll.loaded = 0;
     if (a == FA_BUSY) fprintf(stderr, "[%6d ms] %s\n", now_ms, x ? "busy: developing" : "busy: done");
+#ifdef CONFIG_R
+    /* the clock runs on what the frame waits for, so no script can say when it will be over */
+    if (a == FA_BUSY) { developing = x; if (!x) end_t = now_ms + 100; }
+#endif
 }
 
 void fos_port_clock(char *buf, int size) { snprintf(buf, size, "09:41"); }
@@ -233,6 +259,9 @@ int main(int argc, char **argv)
     fos_port_palette();
     fos_ui_run(open);
     if (frame_dirty) dump();
+#ifdef CONFIG_R
+    fprintf(stderr, "dark: %d presents; after it: %d, %d of the whole screen\n", presents_dark, presents_after, whole_after);
+#endif
     fprintf(stderr, "%d frames, %d ms\n", frame_no, now_ms);
     return 0;
 }

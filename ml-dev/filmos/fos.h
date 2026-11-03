@@ -181,6 +181,8 @@ void fos_port_log(const char *msg);         /* the debug log, if it is on */
 /* fn(arg) on the camera's other core, 1 if it was started. fn may touch only memory: no files,
  * no clock, no log, and not the screen. */
 int  fos_port_other_core(void (*fn)(void *), void *arg);
+/* Canon has turned the display off while something develops: nothing drawn would show */
+int  fos_port_screen_dark();
 #endif
 /* developing works in slices until a time budget is spent; the simulator's
  * clock stands still meanwhile, so it caps the slices instead (0: no cap) */

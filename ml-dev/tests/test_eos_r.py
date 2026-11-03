@@ -388,7 +388,7 @@ int main(void) {
         # only the first roll of "develop all" got done. It can't be stopped on this body
         # (powersave_prohibit is a property write the whitelist refuses).
         source = (ROOT / "ml-dev/fork/src/filmroll.c").read_text(encoding="utf-8")
-        function = c_function(source, "int fos_port_abort()")
+        function = c_function(source, "int fos_port_screen_dark()") + c_function(source, "int fos_port_abort()")
         program = self.src / "abort.c"
         program.write_text("""#include <assert.h>
 #define CONFIG_R
@@ -404,10 +404,13 @@ int main(void) {
     /* not developing: as ever */
     DISPLAY_IS_ON = 0; assert(fos_port_abort()); DISPLAY_IS_ON = 1;
     CURRENT_GUI_MODE = 129; assert(settled()); CURRENT_GUI_MODE = GUIMODE_ML_MENU; fos_port_abort();
-    /* developing: on through the display going off */
+    assert(!fos_port_screen_dark());
+    DISPLAY_IS_ON = 0; assert(!fos_port_screen_dark()); DISPLAY_IS_ON = 1;
+    /* developing: on through the display going off, with nothing to draw for */
     dev_busy = 1;
-    DISPLAY_IS_ON = 0; assert(!fos_port_abort()); DISPLAY_IS_ON = 1;
-    CURRENT_GUI_MODE = 129; assert(!settled());
+    assert(!fos_port_screen_dark());
+    DISPLAY_IS_ON = 0; assert(!fos_port_abort()); assert(fos_port_screen_dark()); DISPLAY_IS_ON = 1;
+    CURRENT_GUI_MODE = 129; assert(!settled()); assert(fos_port_screen_dark());
     /* but a half press stops it, and so does shutting down, and any other Canon screen */
     halfshutter = 1; assert(fos_port_abort()); halfshutter = 0;
     ml_shutdown_requested = 1; assert(fos_port_abort()); ml_shutdown_requested = 0;

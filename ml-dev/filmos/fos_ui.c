@@ -783,6 +783,9 @@ void fos_ui_run(int open)
     int opened = 0;
     memset(&stat, 0, sizeof(stat));
     stat_since = frame_end = 0;
+#ifdef CONFIG_R
+    int was_dark = 0;
+#endif
     while (!quit)
     {
         int now = fos_port_ms();
@@ -836,6 +839,23 @@ void fos_ui_run(int open)
             moving |= screen_update(dt);
             if (tr_len && tr_t < tr_len) { tr_t += dt; moving = 1; }
         }
+
+#ifdef CONFIG_R
+        /* The display is off in the middle of developing: the first core's time all goes to the
+         * frame, but for a moment for the camera's own tasks. All of it is drawn when it comes back. */
+        if (fos_port_screen_dark() && !leaving && enter_t >= ENTER_LEN)
+        {
+            was_dark = 1;
+            fos_port_sleep(1);
+            continue;
+        }
+        if (was_dark)
+        {
+            was_dark = 0;
+            ui_clobbered = 1;
+            ui_damage_all();
+        }
+#endif
 
         int in_tr = tr_len && tr_t < tr_len;
         int t_draw = fos_port_ms();

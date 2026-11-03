@@ -198,14 +198,18 @@ Developing uses both of this body's cores, at the lowest task priority, so Canon
 come first. The second core touches only memory: it takes the film's and the JPEG's rows
 and decodes the CR3's lines, while the first core does every card read and adds the lines
 to the print in their usual order. If the second core can't start, or there is no memory
-for it, the first does it all, with the same bytes. With Display off at 15 s, two frames of
-42.6 MB took 15.6 and 15.7 s: 5.1 and 5.3 s decoding (2.6 and 2.5 of it reading the card), 4.8
-film, 2.9 JPEG, 1.0 print, with the second core on about 14,900 of 18,184 lines. The steps add
-up to about 13.9 s; the rest is the darkroom's screen, still drawn while the display is off. A
-37.2 MB frame before decoding used the second core took 22.3 s, 11.5 of it decoding (2.9 reading
-the card). Those are not the same frames. A frame that began with the screen on took 23.4 s,
-13.0 decoding, and its reads took twice as long. The JPEGs and prints of those three frames from
-the camera are byte for byte what the PC makes, on one core or two.
+for it, the first does it all, with the same bytes. While the display is off the darkroom draws
+nothing, and its first core's time goes to the frame. Waking the display mid-develop brought the
+darkroom back after about a second, whole, in the one try so far. With Display off at 15 s, frames
+of 40.7 and 38.8 MB took 14.2 s each in a build whose only difference was aligned code, which gained
+nothing measurable. In the build without it, a 40.9 MB frame took 5.5 s from opening to decoded (2.4
+of it reading the card) and 4.8 film, with the second core on about 13,600 of 18,184 lines; JPEG
+and print were not clean there, as the display had been woken. A 37.2 MB frame before decoding used
+the second core took 22.3 s, 11.5 of it decoding (2.9 reading the card). Those are not the same
+frames. A frame that began with the screen on took 23.1 s, 12.8 decoding, and its reads took twice
+as long; with the screen on the film and JPEG take about twice as long too. The JPEGs and prints of
+the frames developed this way, the woken ones too, are byte for byte what the PC makes, on one core
+or two.
 
 The JPEG is written in one go, so the screen
 pauses meanwhile. `autoexec.bin` of 362,784 bytes starts; the boot limit is unknown.
