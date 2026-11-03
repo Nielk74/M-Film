@@ -318,37 +318,37 @@ static int exif(uint8_t *out, const struct fos_jpeg_meta *m)
 #define RING_SLOTS 16
 #define MCU_COEFFS (6 * 64)
 
-/* Real film's shadows hold little colour noise, a high ISO's a lot. In the dark parts of a big frame
- * each chroma sample moves towards the mean of the dark samples about it. A brighter sample neither
- * moves nor lends its colour, so nothing bleeds into the black beside it. Smaller frames have
- * averaged their noise away already. */
+/* A high ISO's static isn't film's. In a big frame each chroma sample (2 x 2 pixels) goes to the mean of
+ * those about it, unless the colour really changes there; and each pixel most of the way to the mean of
+ * its neighbours, unless it's an edge. Smaller frames have averaged their noise away already. */
 #define CALM_WIDTH 2000
-#define CALM_R 2                /* in samples, each 2 x 2 pixels */
-#define CALM_DARK 110           /* a sample this bright keeps out of it */
-#define CALM_FROM 30            /* the mean brightness about it: all the way below this */
-#define CALM_TO 90              /* and not at all from this */
+#define CALM_R 2                /* the samples' reach */
+#define CALM_N2 2048            /* the colour noise's variance, Cb's and Cr's, in 1/16 of a level squared */
+#define CALM_STEP 6             /* the table's: variance >> this */
+#define SOFT_EDGE 14            /* a step this big from the neighbours' mean is an edge */
+#define SOFT_MOVE 192           /* how far to the mean, in 1/256 */
 
 static int32_t calm_recip[(2 * CALM_R + 1) * (2 * CALM_R + 1) + 1];
-static uint16_t calm_weight[256];
+static uint16_t calm_keep[(64 * CALM_N2 >> CALM_STEP) + 1];     /* how much of a sample's difference from the mean stays, in 1/256 */
 
 static void calm_tables()
 {
-    const int span = CALM_TO - CALM_FROM;
     for (int n = 1; n < (int) (sizeof(calm_recip) / sizeof(calm_recip[0])); n++) calm_recip[n] = 65536 / n;
-    for (int v = 0; v < 256; v++)
+    for (int i = 0; i < (int) (sizeof(calm_keep) / sizeof(calm_keep[0])); i++)
     {
-        const int t = v <= CALM_FROM ? 0 : v >= CALM_TO ? span : v - CALM_FROM;
-        calm_weight[v] = (uint16_t) (256 - 256 * t * t * (3 * span - 2 * t) / (span * span * span));
+        const int var = i << CALM_STEP;
+        calm_keep[i] = (uint16_t) (var <= CALM_N2 ? 0 : 256 - (CALM_N2 << 8) / var);
     }
 }
 
-/* one core's working memory for a row's chroma */
-struct chroma
+/* one core's working memory for a row */
+struct work
 {
-    int32_t *cb, *cr;           /* the samples: its 8 rows and the reach more on each side; sums of 4 pixels */
-    int32_t *col;               /* cb, cr, brightness and how many, of a column's dark samples in reach */
+    int32_t *cb, *cr;           /* the samples, in 1/4 level: the row's 8 rows and the reach more on each side */
+    int32_t *col;               /* cb, cr and their squares' sum, of a column's samples in reach */
     int16_t *out;               /* the row's (cb, cr), as the blocks take them */
-    uint8_t *peak;              /* its strongest colour: by brightness alone, neon red or blue would pass for dark */
+    uint8_t *luma;              /* the row's brightness, and with calm one more row on each side */
+    uint8_t *soft;              /* softened: the row's */
 };
 
 struct ring
@@ -359,98 +359,98 @@ struct ring
     void *const *rows;
     int mcus, nrows, slots;
     int calm;                   /* the reach, in samples; 0: none */
-    struct chroma chroma[2];    /* this core's, the other's */
+    struct work work[2];        /* this core's, the other's */
     int16_t *coeffs;            /* slots x mcus x MCU_COEFFS */
     int *ready;                 /* a slot's row + 1, once it is prepared */
     int next, written, busy;    /* atomics */
     int other_rows;
 };
 
-static int chroma_alloc(const struct ring *g, struct chroma *s)
+static int work_alloc(const struct ring *g, struct work *s)
 {
-    const int cells = g->mcus * 8, samples = cells * (8 + 2 * g->calm);
-    int32_t *m = fos_port_alloc(samples * 2 * 4 + cells * 4 * 4 + cells * 8 * 2 * 2 + samples);
+    const int cells = g->mcus * 8, columns = g->mcus * 16, samples = cells * (8 + 2 * g->calm);
+    const int rows = 16 + (g->calm ? 2 : 0), soft = g->calm ? 16 * columns : 0;
+    int32_t *m = fos_port_alloc(samples * 2 * 4 + cells * 3 * 4 + cells * 8 * 2 * 2 + rows * columns + soft);
     if (!m) return 0;
     s->cb = m;
     s->cr = s->cb + samples;
     s->col = s->cr + samples;
-    s->out = (int16_t *) (s->col + cells * 4);
-    s->peak = (uint8_t *) (s->out + cells * 8 * 2);
+    s->out = (int16_t *) (s->col + cells * 3);
+    s->luma = (uint8_t *) (s->out + cells * 8 * 2);
+    s->soft = s->luma + rows * columns;
     return 1;
 }
 
+/* the edges repeat the last row */
+static const uint8_t *frame_row(const struct ring *g, int y)
+{
+    y = y < 0 ? 0 : y < g->height ? y : g->height - 1;
+    return g->rows ? (const uint8_t *) g->rows[y] + 3 * g->x0 : g->rgb + y * g->stride;
+}
+
 /* a row of samples into the columns' sums (sign 1) or out of them (sign -1) */
-static void calm_columns(const struct chroma *s, int cells, int row, int sign)
+static void calm_columns(const struct work *s, int cells, int row, int sign)
 {
     const int32_t *const cb = s->cb + row * cells, *const cr = s->cr + row * cells;
-    const uint8_t *const peak = s->peak + row * cells;
     int32_t *c = s->col;
-    for (int x = 0; x < cells; x++, c += 4)
+    for (int x = 0; x < cells; x++, c += 3)
     {
-        if (peak[x] >= CALM_DARK) continue;
         c[0] += sign * cb[x];
         c[1] += sign * cr[x];
-        c[2] += sign * peak[x];
-        c[3] += sign;
+        c[2] += sign * (cb[x] * cb[x] + cr[x] * cr[x]);
     }
 }
 
-/* row r's chroma into s->out; the sums of 2 x 2 pixels, the edges repeating the last pixel */
-static void chroma_row(const struct ring *g, int r, const struct chroma *s)
+/* row r's chroma into s->out; sums of 2 x 2 pixels, the edges repeating the last pixel */
+static void chroma_row(const struct ring *g, int r, const struct work *s)
 {
-    const int cells = g->mcus * 8, R = g->calm, width = g->width, height = g->height;
+    const int cells = g->mcus * 8, R = g->calm, width = g->width;
     int32_t *cb = s->cb, *cr = s->cr;
-    uint8_t *peak = s->peak;
     for (int cy = -R; cy < 8 + R; cy++)
     {
-        int y0 = r * 16 + 2 * cy, y1 = y0 + 1;
-        y0 = y0 < 0 ? 0 : y0 < height ? y0 : height - 1;
-        y1 = y1 < 0 ? 0 : y1 < height ? y1 : height - 1;
-        const uint8_t *const p0 = g->rows ? (const uint8_t *) g->rows[y0] + 3 * g->x0 : g->rgb + y0 * g->stride;
-        const uint8_t *const p1 = g->rows ? (const uint8_t *) g->rows[y1] + 3 * g->x0 : g->rgb + y1 * g->stride;
+        const uint8_t *const p0 = frame_row(g, r * 16 + 2 * cy), *const p1 = frame_row(g, r * 16 + 2 * cy + 1);
         for (int cx = 0; cx < cells; cx++)
         {
             const int a = 3 * (2 * cx < width ? 2 * cx : width - 1), b = 3 * (2 * cx + 1 < width ? 2 * cx + 1 : width - 1);
             const int r_ = p0[a] + p0[b] + p1[a] + p1[b];
             const int g_ = p0[a + 1] + p0[b + 1] + p1[a + 1] + p1[b + 1];
             const int bl = p0[a + 2] + p0[b + 2] + p1[a + 2] + p1[b + 2];
-            *cb++ = -11059 * r_ - 21709 * g_ + 32768 * bl;
-            *cr++ = 32768 * r_ - 27439 * g_ - 5329 * bl;
-            *peak++ = (uint8_t) ((r_ > g_ ? (r_ > bl ? r_ : bl) : (g_ > bl ? g_ : bl)) >> 2);
+            *cb++ = (-11059 * r_ - 21709 * g_ + 32768 * bl + 32768) >> 16;
+            *cr++ = (32768 * r_ - 27439 * g_ - 5329 * bl + 32768) >> 16;
         }
     }
-    if (R) memset(s->col, 0, cells * 4 * sizeof(int32_t));
-    for (int y = 0; R && y <= 2 * R; y++) calm_columns(s, cells, y, 1);
+    if (!R)
+    {
+        for (int i = 0; i < 8 * cells; i++)
+        {
+            s->out[2 * i] = (int16_t) ((s->cb[i] + 2) >> 2);
+            s->out[2 * i + 1] = (int16_t) ((s->cr[i] + 2) >> 2);
+        }
+        return;
+    }
+    const int32_t *const c = s->col;
+    memset(s->col, 0, cells * 3 * sizeof(int32_t));
+    for (int y = 0; y <= 2 * R; y++) calm_columns(s, cells, y, 1);
     for (int oy = 0; oy < 8; oy++)
     {
-        const int own = (oy + R) * cells;
-        const int32_t *const c = s->col;
-        int32_t scb = 0, scr = 0, sl = 0, sn = 0;
-        for (int x = 0; R && x <= R; x++) { scb += c[4 * x]; scr += c[4 * x + 1]; sl += c[4 * x + 2]; sn += c[4 * x + 3]; }
+        const int32_t *const own_b = s->cb + (oy + R) * cells, *const own_r = s->cr + (oy + R) * cells;
+        int32_t sb = 0, sr = 0, sq = 0, cols = 0;
+        for (int x = 0; x <= R; x++) { sb += c[3 * x]; sr += c[3 * x + 1]; sq += c[3 * x + 2]; cols++; }
         int16_t *o = s->out + oy * cells * 2;
         for (int x = 0; x < cells; x++, o += 2)
         {
-            int32_t vb = s->cb[own + x], vr = s->cr[own + x];
-            if (R)
-            {
-                if (s->peak[own + x] < CALM_DARK)
-                {
-                    const int32_t re = calm_recip[sn];
-                    const int w = calm_weight[(sl * re) >> 16];
-                    if (w)
-                    {
-                        vb = (int32_t) (((int64_t) vb * (256 - w) + ((int64_t) scb * re >> 16) * w) >> 8);
-                        vr = (int32_t) (((int64_t) vr * (256 - w) + ((int64_t) scr * re >> 16) * w) >> 8);
-                    }
-                }
-                const int in = x + R + 1, away = x - R;
-                if (in < cells) { scb += c[4 * in]; scr += c[4 * in + 1]; sl += c[4 * in + 2]; sn += c[4 * in + 3]; }
-                if (away >= 0) { scb -= c[4 * away]; scr -= c[4 * away + 1]; sl -= c[4 * away + 2]; sn -= c[4 * away + 3]; }
-            }
-            o[0] = (int16_t) ((vb + 131072) >> 18);
-            o[1] = (int16_t) ((vr + 131072) >> 18);
+            const int32_t re = calm_recip[cols * (2 * R + 1)];
+            const int32_t mb = (sb * re + 32768) >> 16, mr = (sr * re + 32768) >> 16;
+            const int32_t var = (int32_t) (((int64_t) sq * re) >> 16) - mb * mb - mr * mr;
+            const int at = var >> CALM_STEP;
+            const int keep = at <= 0 ? 0 : at < (int) (sizeof(calm_keep) / sizeof(calm_keep[0])) ? calm_keep[at] : 256;
+            o[0] = (int16_t) ((mb + (((own_b[x] - mb) * keep) >> 8) + 2) >> 2);
+            o[1] = (int16_t) ((mr + (((own_r[x] - mr) * keep) >> 8) + 2) >> 2);
+            const int in = x + R + 1, away = x - R;
+            if (in < cells) { sb += c[3 * in]; sr += c[3 * in + 1]; sq += c[3 * in + 2]; cols++; }
+            if (away >= 0) { sb -= c[3 * away]; sr -= c[3 * away + 1]; sq -= c[3 * away + 2]; cols--; }
         }
-        if (R && oy < 7)
+        if (oy < 7)
         {
             calm_columns(s, cells, oy, -1);
             calm_columns(s, cells, oy + 2 * R + 1, 1);
@@ -458,45 +458,53 @@ static void chroma_row(const struct ring *g, int r, const struct chroma *s)
     }
 }
 
-static void prepare_row(const struct ring *g, int r, const struct chroma *s)
+/* row r's brightness; with calm, softened into s->soft. The edges repeat the last pixel */
+static void luma_row(const struct ring *g, int r, const struct work *s)
 {
-    const int width = g->width, height = g->height, stride = g->stride, x0 = g->x0;
-    const uint8_t *const rgb = g->rgb;
-    void *const *const rows = g->rows;
+    const int columns = g->mcus * 16, margin = g->calm ? 1 : 0;
+    const int inside = g->width < columns ? g->width : columns;
+    uint8_t *luma = s->luma;
+    for (int y = -margin; y < 16 + margin; y++, luma += columns)
+    {
+        const uint8_t *px = frame_row(g, r * 16 + y);
+        for (int x = 0; x < inside; x++, px += 3)
+            luma[x] = (uint8_t) ((19595 * px[0] + 38470 * px[1] + 7471 * px[2] + 32768) >> 16);
+        for (int x = inside; x < columns; x++) luma[x] = luma[inside - 1];
+    }
+    if (!margin) return;
+    for (int y = 0; y < 16; y++)
+    {
+        const uint8_t *const up = s->luma + y * columns, *const mid = up + columns, *const down = mid + columns;
+        uint8_t *const o = s->soft + y * columns;
+        for (int x = 0; x < columns; x++)
+        {
+            const int l = x ? x - 1 : 0, f = x + 1 < columns ? x + 1 : x, v = mid[x];
+            const int d = ((4 * v + 2 * (mid[l] + mid[f] + up[x] + down[x]) + up[l] + up[f] + down[l] + down[f] + 8) >> 4) - v;
+            o[x] = (uint8_t) (d < SOFT_EDGE && -d < SOFT_EDGE ? v + ((d * SOFT_MOVE + 128) >> 8) : v);
+        }
+    }
+}
+
+static void prepare_row(const struct ring *g, int r, const struct work *s)
+{
+    const int cells = g->mcus * 8, columns = g->mcus * 16;
     int16_t *out = g->coeffs + (r % g->slots) * g->mcus * MCU_COEFFS;
-    const int my = r * 16;
     int32_t blk[64], cb[64], cr[64];
     chroma_row(g, r, s);
-    for (int mx = 0; mx < width; mx += 16, out += MCU_COEFFS)
+    luma_row(g, r, s);
+    const uint8_t *const luma = g->calm ? s->soft : s->luma;
+    for (int m = 0; m < g->mcus; m++, out += MCU_COEFFS)
     {
         for (int b = 0; b < 4; b++)
         {
-            int bx = mx + (b & 1) * 8, by = my + (b >> 1) * 8;
-            for (int y = 0; y < 8; y++)
-            {
-                const int ry = by + y < height ? by + y : height - 1;
-                const uint8_t *row = rows ? (const uint8_t *) rows[ry] + 3 * x0 : rgb + ry * stride;
-                if (bx + 8 <= width)
-                {
-                    /* nearly every block: no edge to repeat */
-                    const uint8_t *px = row + 3 * bx;
-                    int32_t *lum = blk + y * 8;
-                    for (int x = 0; x < 8; x++, px += 3)
-                        lum[x] = ((19595 * px[0] + 38470 * px[1] + 7471 * px[2] + 32768) >> 16) - 128;
-                    continue;
-                }
-                for (int x = 0; x < 8; x++)
-                {
-                    const uint8_t *px = row + 3 * (bx + x < width ? bx + x : width - 1);
-                    blk[y * 8 + x] = ((19595 * px[0] + 38470 * px[1] + 7471 * px[2] + 32768) >> 16) - 128;
-                }
-            }
+            const uint8_t *px = luma + (b >> 1) * 8 * columns + m * 16 + (b & 1) * 8;
+            for (int y = 0; y < 8; y++, px += columns)
+                for (int x = 0; x < 8; x++) blk[y * 8 + x] = px[x] - 128;
             block_prepare(blk, g->w->recip[0], out + b * 64);
         }
-        const int cells = g->mcus * 8, at = mx / 2;
         for (int i = 0; i < 64; i++)
         {
-            const int16_t *const c = s->out + 2 * ((i >> 3) * cells + at + (i & 7));
+            const int16_t *const c = s->out + 2 * ((i >> 3) * cells + m * 8 + (i & 7));
             cb[i] = c[0];
             cr[i] = c[1];
         }
@@ -524,7 +532,7 @@ static void ring_other_core(void *arg)
         if (r == -2) break;
         if (r >= 0)
         {
-            prepare_row(g, r, &g->chroma[1]);
+            prepare_row(g, r, &g->work[1]);
             g->other_rows++;
         }
     }
@@ -632,7 +640,7 @@ int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, 
         ring_mem = fos_port_alloc(g.slots * (int) sizeof(int) + g.slots * g.mcus * MCU_COEFFS * (int) sizeof(int16_t));
         if (ring_mem) break;
     }
-    if (!ring_mem || !chroma_alloc(&g, &g.chroma[0]))
+    if (!ring_mem || !work_alloc(&g, &g.work[0]))
     {
         fos_port_free(ring_mem);
         fos_port_close(w->f);
@@ -643,7 +651,7 @@ int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, 
     g.ready = ring_mem;
     g.coeffs = (int16_t *) (ring_mem + g.slots);
     __atomic_store_n(&g.busy, 1, __ATOMIC_RELEASE);
-    if (!chroma_alloc(&g, &g.chroma[1]) || !fos_port_other_core(ring_other_core, &g)) __atomic_store_n(&g.busy, 0, __ATOMIC_RELEASE);
+    if (!work_alloc(&g, &g.work[1]) || !fos_port_other_core(ring_other_core, &g)) __atomic_store_n(&g.busy, 0, __ATOMIC_RELEASE);
     for (int r = 0; r < g.nrows; )
     {
         if (__atomic_load_n(&g.ready[r % g.slots], __ATOMIC_ACQUIRE) == r + 1)
@@ -659,12 +667,12 @@ int fos_jpeg_write(const char *path, const uint8_t *rgb, int stride, int width, 
             continue;
         }
         const int c = ring_claim(&g);
-        if (c >= 0) prepare_row(&g, c, &g.chroma[0]);
+        if (c >= 0) prepare_row(&g, c, &g.work[0]);
     }
     while (__atomic_load_n(&g.busy, __ATOMIC_ACQUIRE)) fos_port_sleep(1);
     fos_port_free(ring_mem);
-    fos_port_free(g.chroma[0].cb);
-    fos_port_free(g.chroma[1].cb);
+    fos_port_free(g.work[0].cb);
+    fos_port_free(g.work[1].cb);
     {
         char msg[64];
         snprintf(msg, sizeof(msg), "dev: other core: %d of %d rows of the JPEG", g.other_rows, g.nrows);

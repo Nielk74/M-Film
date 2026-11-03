@@ -2187,8 +2187,9 @@ static __attribute__((noinline)) unsigned finish_grain(uint8_t *o, int n, unsign
 
 #ifdef FOS_CR3
 /* film grain: a tile laid in 32-pixel blocks at random offsets, as AV1's film grain synthesis,
- * its strength by brightness (films/eos_r). Tiles: luma, then (Cb, Cr) pairs, standard deviation 32;
- * gain: the luma's standard deviation at mid grey, in 1/256 of a level. */
+ * its strength by the local tone (films/eos_r): by each pixel's own, its noise would link up into
+ * traces. Tiles: luma, then (Cb, Cr) pairs, standard deviation about 40 and 32;
+ * gain: the luma's strength at mid grey, for a standard deviation of 32, in 1/256 of a level. */
 #define GRAIN_TILE 128
 #define GRAIN_SET (2 * GRAIN_TILE * GRAIN_TILE + 256)
 #define GRAIN_BYTES (2 * GRAIN_SET)     /* fine, then coarse */
@@ -2205,6 +2206,7 @@ static __attribute__((noinline)) void finish_tile(uint8_t *o, int n, const uint8
 {
     const int8_t *const luma = (const int8_t *) tiles, *const colour = luma + GRAIN_TILE * GRAIN_TILE;
     const uint8_t *const tone = tiles + 2 * GRAIN_TILE * GRAIN_TILE;
+    int local = (o[0] * 77 + o[1] * 150 + o[2] * 29) >> 4;      /* in 1/16 level */
     for (int x = 0; x < n; )
     {
         const uint32_t h = grain_hash(x >> 5, y >> 5, seed);
@@ -2215,7 +2217,8 @@ static __attribute__((noinline)) void finish_tile(uint8_t *o, int n, const uint8
         for (; x < end; x++, o += 3)
         {
             const int r = o[0], g = o[1], b = o[2];
-            const int a = (gain * tone[(r * 77 + g * 150 + b * 29) >> 8]) >> 7;
+            local += (((r * 77 + g * 150 + b * 29) >> 4) - local) >> 3;
+            const int a = (gain * tone[local >> 4]) >> 7;
             const int dy = (l[(lx + x) & 127] * a) >> 13;
             const int8_t *const pair = c + 2 * ((cx + (x >> 1)) & 63);
             const int a2 = mono ? 0 : (a * 90) >> 8;    /* colour: 0.35 of the luma's */
