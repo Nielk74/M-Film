@@ -14,6 +14,7 @@ Portra 400, Gold 200 and CineStill 800T have recipes, chosen on the user's own f
 1. `portra400.ts`, `gold200.ts` and `cinestill800t.ts` write the look as a cube over Canon's rendering, from
    grmod-film's recipes: less warmth, half the teal mixer, a gentler colour push, subtractive density.
 2. `make_table.py` puts `base_rendering.json` and a softer highlight roll-off in front of it and writes the table.
+3. For Portra 400, `portra_shadows.py` then takes half the warmth out of the shadows.
 
 The other 69 start from the table the build makes from their look or their LUT. `retune.py` rebases that: Canon's
 colour, Canon's mid grey, a grey ramp between Canon's tone with soft highlights and the film's own, part of the
@@ -28,11 +29,13 @@ Picture Style they were shot with isn't known.
 
 ## The grain
 
-`grain.bin` is grmod-film's film grain (`core/src/color/grain-tables.ts`, made by its `tools/grain/tiles.py`
-from the Boolean film grain model): for fine, then coarse, a 128 x 128 luma tile, 128 rows of 64 (Cb, Cr) pairs,
-and the strength by brightness in 256 bytes, most in the shadows and lower midtones. `soften_grain.py` then took
-out what is coarser than about 10 pixels, keeping the strength: those clumps showed as dark holes in the noise of
-black areas. It also fades the grain out below brightness 30, as scans of 800T go quiet in their blacks. Its input,
-the tiles as they came, is `grain.bin` at commit 84aba9b.
+`grain.bin` holds, for fine, then coarse, a 128 x 128 luma tile, 128 rows of 64 (Cb, Cr) pairs, and the strength
+by brightness in 256 bytes, most in the shadows and lower midtones. `make_grain.py` makes the tiles: random grains
+of a few sizes, unevenly scattered, chosen on the user's frames against scans of film, because filtered noise
+looked regular. The strength by brightness is grmod-film's (`core/src/color/grain-tables.ts`), faded out right at
+black; its input is `grain.bin` at commit 84aba9b.
+
+A high ISO's own noise is pixel-sharp static, and at ISO 4000 it hides the grain. So `fos_jpeg.c` softens it in
+big frames' JPEGs, keeping edges, and calms their colour noise wherever the colour isn't really changing.
 
 Every number is set by hand or fitted to those frames: these are interpretations, not measurements of the films.

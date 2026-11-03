@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SIM = ROOT / "ml-dev/filmos/sim"
 BASE = "https://raw.pixls.us/data/Canon/EOS R/"
 FINE_GRAIN = "gold200"
+SHADOW_WARMTH = -3.0     # red less blue along the grey ramp: the table leans cool, against warm light
 SAMPLES = {
     "Canon_EOS_R_RAW_ISO_100.CR3": "89bd55532b0cceb5efa360e97827ba35c2076bce0de4675f3a4413a883dac880",
     "Canon_EOS_R_CRAW_ISO_100.CR3": "1b3efe0664a28a0decb53e225cbfecdbc0dd27d85abdc4683fc2a4add5129b4d",
@@ -239,8 +240,8 @@ def install_tables(folder):
 class EosRFilmTests(unittest.TestCase):
     """The EOS R's films: the shot's white balance, a quarter of the scanner, their tables, film grain."""
 
-    TABLES = {"portra400": "095f0b15e87e8afe", "gold200": "de1be4c0d476c648", "cinestill800t": "2a5ebccccc1addd8"}
-    GRAIN = "9e762caf5b8d73d9"
+    TABLES = {"portra400": "d5246fdb5ef9fe35", "gold200": "de1be4c0d476c648", "cinestill800t": "2a5ebccccc1addd8"}
+    GRAIN = "5589986eed795fe7"
 
     @classmethod
     def setUpClass(cls):
@@ -369,29 +370,40 @@ class EosRFilmTests(unittest.TestCase):
         self.assertEqual(len(outputs), 1, "all of these fall back to the same noise")
         self.assertNotIn(film, outputs)
 
-    def test_the_grain_has_no_clumps_to_show_as_holes(self):
+    def grain_tile(self, at):
         grain = (ROOT / "ml-dev/films/eos_r/grain.bin").read_bytes()
-        for name, at in (("fine", 0), ("coarse", 2 * 128 * 128 + 256)):
-            tile = [[v - 256 if v > 127 else v for v in grain[at + y * 128:at + (y + 1) * 128]] for y in range(128)]
-            values = [v for row in tile for v in row]
-            mean = sum(values) / len(values)
-            spread = (sum((v - mean) ** 2 for v in values) / len(values)) ** 0.5
-            self.assertAlmostEqual(spread, 32, delta=0.5, msg=f"{name}: its strength stays")
-            # the mean of each 16 x 16 patch, the tile wrapping: white noise would give 2
-            patches = []
-            for y in range(0, 128, 4):
-                for x in range(0, 128, 4):
-                    patches.append(sum(tile[(y + j) & 127][(x + i) & 127] for j in range(16) for i in range(16)) / 256)
-            patch_spread = (sum(v * v for v in patches) / len(patches)) ** 0.5
-            self.assertLess(patch_spread, 2.5, f"{name}: patches this far from the mean look like holes in dark areas")
+        return numpy.frombuffer(grain, numpy.int8, 128 * 128, at).reshape(128, 128).astype(float)
 
-    def test_the_grain_fades_out_near_black(self):
+    def test_the_grain_is_uneven_and_has_no_regular_structure(self):
+        for name, at, strength in (("fine", 0, 41.6), ("coarse", 2 * 128 * 128 + 256, 38.4)):
+            tile = self.grain_tile(at)
+            self.assertAlmostEqual(tile.std(), strength, delta=0.6, msg=name)
+            z = (tile - tile.mean()) / tile.std()
+            for lag in (2, 3, 4):
+                correlation = (z * numpy.roll(z, lag, 1)).mean()
+                self.assertGreater(correlation, -0.02, f"{name}: a dip at {lag} pixels reads as a regular pattern")
+            self.assertGreater((z ** 4).mean() - 3, 0.2, f"{name}: real grain has its stronger specks")
+            # the tile wraps: 8 x 8 patches, from all the tile's positions
+            patches = numpy.stack([numpy.roll(numpy.roll(z * z, -y, 0), -x, 1)[:8, :8].mean()
+                                   for y in range(0, 128, 8) for x in range(0, 128, 8)]) ** 0.5
+            self.assertGreater(patches.std() / patches.mean(), 0.15, f"{name}: some places busier than others")
+
+    def test_the_grain_fades_out_only_right_at_black(self):
         grain = (ROOT / "ml-dev/films/eos_r/grain.bin").read_bytes()
-        for name, at in (("fine", 2 * 128 * 128), ("coarse", 2 * 128 * 128 + 256 + 2 * 128 * 128)):
+        for name, at, at_30 in (("fine", 2 * 128 * 128, 133), ("coarse", 2 * 128 * 128 + 256 + 2 * 128 * 128, 150)):
             tone = grain[at:at + 256]
-            self.assertEqual(tone[0], 0, name)
-            self.assertLess(tone[12], 25, f"{name}: real film goes quiet in its blacks")
-            self.assertEqual(tone[128], 128, f"{name}: mid grey keeps its strength")
+            self.assertLess(tone[3], 5, name)
+            self.assertGreater(tone[12], 50, name)
+            self.assertEqual(tone[30], at_30, name)
+            self.assertEqual(tone[128], 128, name)
+
+    def test_portra_shadows_are_less_warm(self):
+        table = numpy.frombuffer((ROOT / "ml-dev/films/eos_r/portra400.lut").read_bytes(), numpy.uint8).reshape(33, 33, 33, 3).astype(float)
+        grey = numpy.stack([table[i, i, i] for i in range(33)])
+        luma = grey @ numpy.array((0.299, 0.587, 0.114))
+        shadows = (luma >= 20) & (luma < 60)
+        self.assertGreaterEqual(shadows.sum(), 2)
+        self.assertLess((grey[:, 0] - grey[:, 2])[shadows].mean(), SHADOW_WARMTH)
 
     def test_mixing_without_the_table_never_takes_its_place(self):
         empty = self.work / "empty"
@@ -401,8 +413,9 @@ class EosRFilmTests(unittest.TestCase):
         self.assertFalse((empty / "LOOK00.LUT").exists())
 
 
-class ShadowColourTests(unittest.TestCase):
-    """Real film's shadows hold little colour noise. The JPEG's chroma calms it there, and only there."""
+class FinishedNoiseTests(unittest.TestCase):
+    """A high ISO's static isn't film's. In a big frame's JPEG the colour noise is calmed, wherever the
+    colour isn't really changing, and the pixel-sharp noise softened, wherever there's no edge."""
 
     @classmethod
     def setUpClass(cls):
@@ -416,7 +429,8 @@ class ShadowColourTests(unittest.TestCase):
             raise RuntimeError(result.stderr)
 
     def picture(self, width, height):
-        """Left half dark, right half bright, both with the same colour noise; a red square in the dark."""
+        """Left half dark, right half bright, both with the same noise; a red square in the dark,
+        real colour stripes in the bright."""
         rng = numpy.random.default_rng(8736)
         cells = lambda sd: numpy.kron(rng.normal(0, sd, (height // 2, width // 2)), numpy.ones((2, 2)))
         y = numpy.full((height, width), 26.0)
@@ -425,6 +439,8 @@ class ShadowColourTests(unittest.TestCase):
         cb, cr = cells(6), cells(6)
         rgb = numpy.stack((y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb), axis=2)
         rgb[304:496, 304:496] = (255, 30, 30)       # on the 16 x 16 grid, so no block rings past it
+        for x in range(width * 3 // 4, width - 64, 64):
+            rgb[height // 8:height // 4, x:x + 32] = (220, 90, 90)
         return numpy.clip(numpy.round(rgb), 0, 255).astype(numpy.uint8)
 
     def write(self, width, height):
@@ -435,13 +451,32 @@ class ShadowColourTests(unittest.TestCase):
         writes = int(done.stdout.split()[1])
         return numpy.asarray(Image.open(out).convert("YCbCr")).astype(float), writes, out.stat().st_size
 
-    def test_shadows_lose_colour_noise_and_bright_areas_keep_it(self):
+    @staticmethod
+    def next_pixel(y):
+        r = y - y.mean()
+        return (r[:, 1:] * r[:, :-1]).mean() / (r * r).mean()
+
+    def test_colour_noise_is_calmed_at_every_brightness(self):
         a, _, _ = self.write(2400, 1600)
         dark, bright = a[900:1300, 800:1100], a[900:1300, 1500:1900]
         for channel, name in ((1, "Cb"), (2, "Cr")):
-            self.assertLess(dark[:, :, channel].std(), bright[:, :, channel].std() / 2, name)
-            self.assertGreater(bright[:, :, channel].std(), 4, name)
-        self.assertGreater(dark[:, :, 0].std(), 2, "the brightness noise is the grain's: it stays")
+            self.assertLess(dark[:, :, channel].std(), 2.1, f"{name}, dark")
+            self.assertLess(bright[:, :, channel].std(), 2.1, f"{name}, bright")
+
+    def test_real_colour_stays(self):
+        a, _, _ = self.write(2400, 1600)
+        for x in range(1800, 2300, 64):
+            stripe, gap = a[250:350, x + 12:x + 20, 2].mean(), a[250:350, x + 44:x + 52, 2].mean()
+            self.assertGreater(stripe - gap, 30)
+
+    def test_static_is_softened_and_edges_stay(self):
+        a, _, _ = self.write(2400, 1600)
+        for region, name in ((a[900:1300, 800:1100, 0], "dark"), (a[900:1300, 1500:1700, 0], "bright")):
+            self.assertLess(region.std(), 2.4, name)
+            self.assertGreater(self.next_pixel(region), 0.25, name)
+        edge = a[900:1300, :, 0].mean(axis=0)
+        self.assertLess(edge[1198], 45)
+        self.assertGreater(edge[1201], 130)
 
     def test_a_bright_colour_does_not_bleed_into_the_black_beside_it(self):
         a, _, _ = self.write(2400, 1600)
@@ -451,8 +486,9 @@ class ShadowColourTests(unittest.TestCase):
 
     def test_small_frames_have_averaged_it_already(self):
         a, _, _ = self.write(1200, 800)
-        dark, bright = a[500:700, 400:560], a[500:700, 700:1100]
-        self.assertGreater(dark[:, :, 2].std(), bright[:, :, 2].std() * 0.8)
+        dark = a[500:700, 400:560]
+        self.assertGreater(dark[:, :, 2].std(), 3.5)
+        self.assertLess(self.next_pixel(dark[:, :, 0]), 0.2)
 
     def test_the_file_goes_to_the_card_in_big_pieces(self):
         _, writes, size = self.write(2400, 1600)
@@ -465,13 +501,13 @@ class SameOutputTests(unittest.TestCase):
     # sha256 (first 20) of the JPEG and the print, with the card's tables. They came out the same
     # from this PC's build and from emulated ARM.
     EXPECTED = [
-        ("portra400", {}, False, "d61e76bf8fa6efad7295", "61bcd042f70a0b9144f1"),
-        ("gold200", {}, False, "8152e58f7cffc592226a", "92a673fc94f7d3aaa53d"),
-        ("cinestill800t", {}, False, "a5459aa813b8b3141a63", "e23cddfc760344b5a60a"),
-        ("portra400", {}, True, "0f2106c9ea45a2f520f2", "f5b62ba9c524ed496f9c"),
-        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "2c644f577ddd08fb62a9", None),
-        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "0de2beea5152d537cb26", None),
-        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "7cee9f1c365e1bd03e6a", None),
+        ("portra400", {}, False, "facf4cc498f993de63e6", "51a173f480124dfe45f8"),
+        ("gold200", {}, False, "2def2254088150747a1d", "c33709bc10ec0d850d25"),
+        ("cinestill800t", {}, False, "fc0cb7bc3b604199b1e2", "17ea497682ac4a21cabe"),
+        ("portra400", {}, True, "f7951a534576c4e945a0", "70c393b922c249eb3e9c"),
+        ("portra400", {"FOS_ALLOC_TOTAL": "45000000"}, False, "21f1b130a9d5f0856f86", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "30000000"}, False, "b5119b84c9ea09a84d99", None),
+        ("portra400", {"FOS_ALLOC_TOTAL": "8000000"}, False, "032a1b5cdc7d1f0dbf9f", None),
     ]
 
     def develop_on(self, binary, work, env):
@@ -516,9 +552,11 @@ class SameOutputTests(unittest.TestCase):
                     [str(binary), "-f", "portra400", "-j", str(work / "o.jpg"), str(work / "wide.CR3"), str(work / "o.FOP")],
                     cwd=SIM, text=True, capture_output=True, timeout=590,
                     env={**os.environ, "FOS_LUT_DIR": str(work / "tables"), "TSAN_OPTIONS": "halt_on_error=1 exitcode=66"})
-                if "unexpected memory mapping" not in done.stderr:
+                # (or it dies without a word as it starts, here on the code before this too)
+                if "unexpected memory mapping" not in done.stderr and not (done.returncode < 0 and not done.stderr):
                     break
             else:
+                self.assertGreaterEqual(done.returncode, 0, "it crashes every time")
                 self.skipTest("ThreadSanitizer can't map its memory on this kernel")
             self.assertEqual(done.returncode, 0, done.stderr[:3000])
             self.assertNotIn("ThreadSanitizer", done.stderr)
